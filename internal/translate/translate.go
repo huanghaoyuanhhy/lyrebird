@@ -1,0 +1,92 @@
+package translate
+
+import "fmt"
+
+// Plan is the protocol-agnostic result of translation: everything the store
+// layer needs to execute a read against Milvus, and nothing protocol-specific.
+// Both translators (es, pg) produce it; store consumes it.
+type Plan struct {
+	// Expr is the Milvus boolean expression that filters entities.
+	// Empty means "no filter" (match everything).
+	Expr string
+
+	// Offset/Limit correspond to ES from/size (PG OFFSET/LIMIT).
+	Offset int
+	Limit  int
+
+	// Sort orders the results. Milvus scalar queries have no server-side
+	// ORDER BY today (docs/design.md decision 4), so the store sorts after
+	// fetching; the plan only records the requested order.
+	Sort []SortClause
+
+	// Source controls which fields are fetched and returned.
+	Source SourceFilter
+
+	// NoMatch marks a query that cannot match anything (e.g. bool with
+	// minimum_should_match above the surviving should-clause count, or an
+	// empty terms list). The store returns an empty result without executing.
+	NoMatch bool
+}
+
+// SortClause is one ordering term; Field is an external (client-facing) name.
+type SortClause struct {
+	Field string
+	Desc  bool
+}
+
+// SourceFilter mirrors the ES _source body parameter.
+type SourceFilter struct {
+	// FetchSource false means hits carry no _source at all (_source: false).
+	FetchSource bool
+	// Includes / Excludes hold exact field names or "prefix.*" patterns.
+	// Empty Includes means all fields.
+	Includes []string
+	Excludes []string
+}
+
+// FieldType is the protocol-agnostic view of a field's type: the minimum the
+// translators need to choose between equivalent encodings (e.g. an ES match
+// on a text field is a token match, on a keyword field an exact compare).
+// The real catalog lands in Phase 3; until then tests feed fixed maps and
+// callers may pass nil (every field unknown).
+type FieldType string
+
+const (
+	TypeKeyword FieldType = "keyword"
+	TypeText    FieldType = "text"
+	TypeNumber  FieldType = "number"
+	TypeBool    FieldType = "bool"
+	TypeDate    FieldType = "date"
+	// TypeUnknown covers fields absent from the catalog.
+	TypeUnknown FieldType = "unknown"
+)
+
+// Schema answers field-type questions for the translators.
+type Schema interface {
+	FieldType(field string) FieldType
+}
+
+// MapSchema is a Schema backed by a plain map; absent fields are unknown.
+type MapSchema map[string]FieldType
+
+var _ Schema = MapSchema{}
+
+func (m MapSchema) FieldType(field string) FieldType {
+	if t, ok := m[field]; ok {
+		return t
+	}
+	return TypeUnknown
+}
+
+// Error is a translation failure with ES-style classification, so protocol
+// layers can render native error envelopes without re-parsing reason strings.
+type Error struct {
+	// Type uses ES vocabulary: parsing_exception (malformed DSL),
+	// illegal_argument_exception (bad values), unsupported_exception
+	// (lyrebird's own: valid request, capability beyond Phase 1).
+	Type   string
+	Reason string
+	Status int
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("%s: %s", e.Type, e.Reason) }

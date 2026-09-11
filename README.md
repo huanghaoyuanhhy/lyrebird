@@ -47,6 +47,9 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
   `X-elastic-product` header), `_search` returns 501
 - [ ] **Phase 1** ES read-only subset: `_search` + bool/term/terms/match/range/exists +
   sort/size/from + `_source` projection
+  - [x] translation layer (`internal/translate/es`: DSL → `translate.Plan`, pure
+    functions + unit tests)
+  - [ ] store wiring: Milvus client executes the plan; `_search` endpoint activation
 - [ ] **Phase 2** PG read-only subset: wire protocol up, psql connects,
   `SELECT .. WHERE .. LIMIT` translation
 - [ ] **Phase 3** Schema catalog: config-driven mapping + describe-based discovery;

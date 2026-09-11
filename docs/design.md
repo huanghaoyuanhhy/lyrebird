@@ -65,3 +65,26 @@
   browsing which endpoints they support
 - PG-side low-level fallback: `jackc/pgx` v5's pgproto3 subpackage (if psql-wire falls short)
 - Outbound access goes through `milvus-sdk-go`, no hand-rolled gRPC
+
+## Settled — Phase 1 translation slice (2026-09-11)
+
+- Contract: `internal/translate` owns `Plan` / `Schema` / `Error`. Both translators emit
+  `Plan`, store consumes it. `Error` carries ES-style `type`/`status` so endpoints render
+  native envelopes without re-parsing reason strings.
+- Error taxonomy: `parsing_exception` (malformed DSL), `illegal_argument_exception` (bad
+  from/size, unparsable values), `unsupported_exception` (valid DSL beyond the Phase 1
+  surface: aggs, knn, search_after, fuzziness, msm>1, date math, …) — all 400.
+- `match` on analyzed text → `TEXT_MATCH` (OR across terms = ES default operator;
+  `operator: and` → AND of per-term calls); `match`/`term` on keyword → `==`.
+  `_score` stays a constant 1.0 until Phase 5 aligns BM25 scoring.
+- `exists` → `is not null` — Milvus nullable-field syntax, re-verify when wiring the store.
+- `sort` is parsed into `Plan.Sort`; the store sorts after fetch until Milvus server-side
+  ORDER BY is confirmed (decision 4 above). `_score`/`_doc` sorts drop out (constant
+  scores, no stable index order).
+- Dates: RFC-3339 / `yyyy-MM-dd` strings → epoch millis at translation time; `||` date
+  math fails fast.
+- `_source` wildcards: exact names and `prefix.*` only; other patterns fail fast.
+- from+size capped at 10000 like ES `max_result_window` — the store will fetch
+  offset+size and sort client-side within that window.
+- Known approximations (documented in code): match tokenization is whitespace-only until
+  Phase 5; `minimum_should_match > 1` needs k-of-n matching, unsupported for now.
