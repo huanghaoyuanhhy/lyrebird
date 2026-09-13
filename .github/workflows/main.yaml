@@ -1,0 +1,107 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+env:
+  go-version: '1.27'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go ${{ env.go-version }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.go-version }}
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+
+  unit-test-go:
+    name: Unit test go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go ${{ env.go-version }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.go-version }}
+          cache: true
+      - name: Unit test with coverage
+        run: go test --race -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Report coverage
+        run: go tool cover -func=coverage.out
+
+  ci-summary:
+    name: CI summary
+    if: always()
+    needs:
+      - lint
+      - unit-test-go
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          results=( ${{ join(needs.*.result, ' ') }} )
+          for r in "${results[@]}"; do
+            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
+              echo "Job failed with status: $r"
+              exit 1
+            fi
+          done
+
+  # Native replacement for the Mergify rules in milvus-backup: label the PR
+  # ci-passed when CI is green, remove the label when it goes red. Runs on the
+  # built-in GITHUB_TOKEN, so no third-party app (Mergify is paid for private
+  # repos) and no extra secrets.
+  ci-label:
+    name: CI label
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs:
+      - lint
+      - unit-test-go
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Ensure ci-passed label exists
+        run: gh label create ci-passed --color 0e8a16 --description "All CI checks passed" || true
+      - name: Add ci-passed when green
+        if: ${{ needs.lint.result == 'success' && needs.unit-test-go.result == 'success' }}
+        run: gh pr edit "$PR" --add-label ci-passed
+      - name: Remove ci-passed when red
+        if: ${{ needs.lint.result != 'success' || needs.unit-test-go.result != 'success' }}
+        run: gh pr edit "$PR" --remove-label ci-passed || true
