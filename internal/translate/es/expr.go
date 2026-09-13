@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode"
 
-	"lyrebird/internal/translate"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 // buildExpr lowers the (already folded) query tree into the Milvus

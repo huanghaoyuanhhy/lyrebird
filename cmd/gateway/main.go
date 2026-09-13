@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"lyrebird/internal/esserver"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/esserver"
 )
 
 func main() {

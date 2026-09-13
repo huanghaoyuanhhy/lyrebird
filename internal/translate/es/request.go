@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"lyrebird/internal/translate"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 const (

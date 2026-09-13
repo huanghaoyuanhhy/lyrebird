@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"lyrebird/internal/translate"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 var testSchema = translate.MapSchema{

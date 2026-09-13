@@ -6,7 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"lyrebird/internal/translate"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 // Executor executes translated plans against the backing store. It is the

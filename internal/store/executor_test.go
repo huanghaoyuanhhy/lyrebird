@@ -9,7 +9,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"lyrebird/internal/translate"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 func newTestExecutor(buf *bytes.Buffer) *LogExecutor {

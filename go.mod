@@ -1,4 +1,4 @@
-module lyrebird
+module github.com/huanghaoyuanhhy/lyrebird
 
 go 1.27.0
 
