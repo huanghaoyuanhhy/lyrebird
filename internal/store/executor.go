@@ -3,7 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
-	"log/slog"
+
+	"go.uber.org/zap"
 
 	"lyrebird/internal/translate"
 )
@@ -37,8 +38,9 @@ type SearchResult struct {
 // success. Entry points wire against it so the full parse → translate →
 // execute path runs before the real store lands.
 type LogExecutor struct {
-	// Logger receives one structured line per search; nil uses slog.Default().
-	Logger *slog.Logger
+	// Logger receives one structured entry per search; nil uses the global
+	// zap.L() (wired by zap.ReplaceGlobals in main).
+	Logger *zap.Logger
 }
 
 // Search implements Executor. Render errors are returned, not swallowed:
@@ -47,7 +49,7 @@ type LogExecutor struct {
 func (e *LogExecutor) Search(ctx context.Context, collection string, plan *translate.Plan) (*SearchResult, error) {
 	logger := e.Logger
 	if logger == nil {
-		logger = slog.Default()
+		logger = zap.L()
 	}
 
 	expr := "(no filter)"
@@ -62,14 +64,14 @@ func (e *LogExecutor) Search(ctx context.Context, collection string, plan *trans
 		expr = rendered
 	}
 
-	logger.InfoContext(ctx, "store: search (log executor)",
-		"collection", collection,
-		"expr", expr,
-		"offset", plan.Offset,
-		"limit", plan.Limit,
-		"sort", plan.Sort,
-		"source", plan.Source,
-		"no_match", plan.NoMatch,
+	logger.Info("store: search (log executor)",
+		zap.String("collection", collection),
+		zap.String("expr", expr),
+		zap.Int("offset", plan.Offset),
+		zap.Int("limit", plan.Limit),
+		zap.Any("sort", plan.Sort),
+		zap.Any("source", plan.Source),
+		zap.Bool("no_match", plan.NoMatch),
 	)
 
 	return &SearchResult{}, nil

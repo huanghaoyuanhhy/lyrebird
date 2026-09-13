@@ -5,8 +5,9 @@ package main
 
 import (
 	"flag"
-	"log"
 	"net/http"
+
+	"go.uber.org/zap"
 
 	"lyrebird/internal/esserver"
 )
@@ -16,9 +17,17 @@ func main() {
 	pgAddr := flag.String("pg-addr", "127.0.0.1:5433", "PostgreSQL wire entry point listen address (placeholder until Phase 2)")
 	flag.Parse()
 
-	log.Printf("pg wire entry point %s not implemented yet (Phase 2)", *pgAddr)
-	log.Printf("ES-compatible entry point listening on %s", *esAddr)
+	// Development format for now; deployments switch to zap.NewProduction().
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+	defer logger.Sync()
+	zap.ReplaceGlobals(logger)
+
+	logger.Info("pg wire entry point not implemented yet (Phase 2)", zap.String("addr", *pgAddr))
+	logger.Info("ES-compatible entry point listening", zap.String("addr", *esAddr))
 	if err := http.ListenAndServe(*esAddr, esserver.New()); err != nil {
-		log.Fatal(err)
+		logger.Fatal("es entry point failed", zap.Error(err))
 	}
 }

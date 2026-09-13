@@ -3,15 +3,19 @@ package store
 import (
 	"bytes"
 	"context"
-	"log/slog"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"lyrebird/internal/translate"
 )
 
 func newTestExecutor(buf *bytes.Buffer) *LogExecutor {
-	return &LogExecutor{Logger: slog.New(slog.NewTextHandler(buf, nil))}
+	cfg := zap.NewProductionEncoderConfig()
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(cfg), zapcore.AddSync(buf), zap.DebugLevel)
+	return &LogExecutor{Logger: zap.New(core)}
 }
 
 func TestLogExecutorReturnsEmptySuccess(t *testing.T) {
@@ -36,7 +40,7 @@ func TestLogExecutorReturnsEmptySuccess(t *testing.T) {
 	}
 
 	out := buf.String()
-	for _, want := range []string{"collection=goods", "status ==", "limit=10"} {
+	for _, want := range []string{`"collection":"goods"`, `status ==`, `"limit":10`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log output missing %q:\n%s", want, out)
 		}
@@ -55,7 +59,7 @@ func TestLogExecutorNoMatchShortCircuit(t *testing.T) {
 	if got.Total != 0 || len(got.Hits) != 0 {
 		t.Fatalf("Search() = %+v, want empty success", got)
 	}
-	if !strings.Contains(buf.String(), "no_match=true") {
+	if !strings.Contains(buf.String(), `"no_match":true`) {
 		t.Errorf("log output missing no_match=true:\n%s", buf.String())
 	}
 }
