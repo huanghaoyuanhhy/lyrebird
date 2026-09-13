@@ -71,6 +71,14 @@
 - Contract: `internal/translate` owns `Plan` / `Schema` / `Error`. Both translators emit
   `Plan`, store consumes it. `Error` carries ES-style `type`/`status` so endpoints render
   native envelopes without re-parsing reason strings.
+- Plan.Expr is a Milvus boolean-expression **tree** (`translate.Expr`), not a string
+  (2026-09-12): plan-level rewrites — Phase 3 field renames, Phase 5 BM25 scoring —
+  transform nodes directly instead of reparsing text. `translate.Render` turns the tree
+  into the executed string and is the shared dialect home for both translators; field-name
+  validation (`[A-Za-z_][A-Za-z0-9_]*`) and literal quoting live there, closing the
+  field-injection hole. The `1 != 1` constant-false guard is isolated in `Never`'s
+  rendering. Values enter the tree already coerced to storage encoding; render is syntax
+  only. Store must call `Render` right before execution.
 - Error taxonomy: `parsing_exception` (malformed DSL), `illegal_argument_exception` (bad
   from/size, unparsable values), `unsupported_exception` (valid DSL beyond the Phase 1
   surface: aggs, knn, search_after, fuzziness, msm>1, date math, …) — all 400.
@@ -88,3 +96,29 @@
   offset+size and sort client-side within that window.
 - Known approximations (documented in code): match tokenization is whitespace-only until
   Phase 5; `minimum_should_match > 1` needs k-of-n matching, unsupported for now.
+
+## Settled — IR placement: query-level IR stays frontend-private (2026-09-13)
+
+- Layering, top to bottom: **query-level IR is per-frontend** (es: the hand-rolled
+  8-node tree in translate/es; pg: the pg_query_go AST when Phase 2 lands) → **the
+  shared Rex-style expression layer is `translate.Expr`** (Compare/InList/TextMatch/
+  NotNull/Not/And/Or/Never — see the 2026-09-12 note above) → **`translate.Render`**
+  emits the dialect string → Milvus lifts it server-side into a typed planpb.Expr tree
+  (pkg/proto/plan.proto). The "shared IR" role is effectively outsourced to Milvus.
+- No shared *query*-level IR, deliberately: with a single backend the N+M-vs-N×M
+  argument pays nothing, and the two languages' semantics don't unite cleanly (match
+  type-dispatch vs SQL `=`, LIKE vs prefix, expression projections vs `_source`
+  patterns; msm / date-math / fuzziness have no SQL counterpart, CASE / arithmetic no
+  ES counterpart). Forcing a union yields a lowest-common-denominator IR full of escape
+  hatches — two IRs in a trenchcoat.
+- What IS shared and why: the expression tree + Render (dialect cannot drift; field
+  validation has one home), and the store-facing `Plan` contract (store would otherwise
+  be duplicated per protocol). Query IR stays private because each language's parse
+  quirks (ES clause dual-forms, msm defaults; SQL grammar) are contained there.
+- Further-unification triggers — any ONE of these justifies merging the query level
+  too (or growing the expression layer):
+  1. a second backend appears (an in-memory test executor counts);
+  2. structured plan rewrites beyond expression scope (e.g. pushdown + residual split
+     needs sub-query trees, not just predicate trees);
+  3. plan-level transforms start needing language-neutral query shape (sort/source
+     rewrites across both frontends).
