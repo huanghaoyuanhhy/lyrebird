@@ -6,9 +6,12 @@ import "fmt"
 // layer needs to execute a read against Milvus, and nothing protocol-specific.
 // Both translators (es, pg) produce it; store consumes it.
 type Plan struct {
-	// Expr is the Milvus boolean expression that filters entities.
-	// Empty means "no filter" (match everything).
-	Expr string
+	// Expr filters entities, as a Milvus boolean-expression tree (see Expr).
+	// nil means "no filter" (match everything). The tree — not a rendered
+	// string — is the contract, so rewrites (field renames, scoring) can
+	// transform plans without parsing text; the store renders it via Render
+	// right before execution, which is also where field names are validated.
+	Expr Expr
 
 	// Offset/Limit correspond to ES from/size (PG OFFSET/LIMIT).
 	Offset int
