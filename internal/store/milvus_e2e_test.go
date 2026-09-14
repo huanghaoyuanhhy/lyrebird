@@ -9,6 +9,7 @@ import (
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/milvustest"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate/es"
 )
 
 // The e2e suite runs against a real Milvus/Zilliz Cloud instance and is
@@ -189,6 +190,47 @@ func TestMilvusExecutorE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("exists on a nullable field respects nulls", func(t *testing.T) {
+		res := mustSearch(t, ctx, exec, &translate.Plan{
+			Expr:  translate.NotNull{Field: "note"},
+			Limit: 10,
+		})
+		if res.Total != 3 {
+			t.Errorf("total=%d, want 3 (note is null on ids 2 and 5)", res.Total)
+		}
+	})
+
+	t.Run("negated exists matches the null side", func(t *testing.T) {
+		res := mustSearch(t, ctx, exec, &translate.Plan{
+			Expr:  translate.Not{Child: translate.NotNull{Field: "note"}},
+			Limit: 10,
+		})
+		if res.Total != 2 {
+			t.Errorf("total=%d, want 2 (the null-note rows)", res.Total)
+		}
+	})
+
+	t.Run("match on analyzed text rides TEXT_MATCH", func(t *testing.T) {
+		schema, err := exec.Schema(ctx, milvustest.TextCollection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if schema.FieldType("body") != translate.TypeText {
+			t.Fatalf("body type = %s, want text (enable_analyzer)", schema.FieldType("body"))
+		}
+		plan, err := es.Translate([]byte(`{"query":{"match":{"body":"quick"}}}`), schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := exec.Search(ctx, milvustest.TextCollection, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Total != 3 {
+			t.Errorf("total=%d, want 3 docs containing 'quick'", res.Total)
+		}
+	})
+
 	t.Run("bool compare", func(t *testing.T) {
 		res := mustSearch(t, ctx, exec, &translate.Plan{
 			Expr:  translate.Compare{Op: translate.Eq, Field: "active", Value: translate.BoolValue(true)},
@@ -218,6 +260,7 @@ func TestMilvusExecutorE2E(t *testing.T) {
 			"qty":        translate.TypeNumber,
 			"active":     translate.TypeBool,
 			"created_ms": translate.TypeNumber,
+			"note":       translate.TypeKeyword,
 			"emb":        translate.TypeUnknown,
 		}
 		for f, w := range want {

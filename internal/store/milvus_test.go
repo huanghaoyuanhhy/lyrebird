@@ -4,8 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/milvus-io/milvus-sdk-go/v2/client"
-	"github.com/milvus-io/milvus-sdk-go/v2/entity"
+	"github.com/milvus-io/milvus/client/v2/column"
+	"github.com/milvus-io/milvus/client/v2/entity"
+	"github.com/milvus-io/milvus/client/v2/milvusclient"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
@@ -23,7 +24,7 @@ func TestBuildProjection(t *testing.T) {
 	fields := fixtureFields()
 
 	t.Run("default fetches and returns every field", func(t *testing.T) {
-		p, err := buildProjection(fields, translate.SourceFilter{FetchSource: true}, nil)
+		p, err := buildProjection(fields, nil, translate.SourceFilter{FetchSource: true}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -37,7 +38,7 @@ func TestBuildProjection(t *testing.T) {
 	})
 
 	t.Run("_source false fetches only the primary key", func(t *testing.T) {
-		p, err := buildProjection(fields, translate.SourceFilter{FetchSource: false}, nil)
+		p, err := buildProjection(fields, nil, translate.SourceFilter{FetchSource: false}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -51,7 +52,7 @@ func TestBuildProjection(t *testing.T) {
 
 	t.Run("includes match exact names and drop unknowns", func(t *testing.T) {
 		src := translate.SourceFilter{FetchSource: true, Includes: []string{"price", "nope"}}
-		p, err := buildProjection(fields, src, nil)
+		p, err := buildProjection(fields, nil, src, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +67,7 @@ func TestBuildProjection(t *testing.T) {
 
 	t.Run("prefix includes expand against the schema", func(t *testing.T) {
 		src := translate.SourceFilter{FetchSource: true, Includes: []string{"p.*"}}
-		p, err := buildProjection(fields, src, nil)
+		p, err := buildProjection(fields, nil, src, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -77,7 +78,7 @@ func TestBuildProjection(t *testing.T) {
 
 	t.Run("excludes remove exact and prefix matches", func(t *testing.T) {
 		src := translate.SourceFilter{FetchSource: true, Excludes: []string{"meta", "price"}}
-		p, err := buildProjection(fields, src, nil)
+		p, err := buildProjection(fields, nil, src, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -88,7 +89,7 @@ func TestBuildProjection(t *testing.T) {
 
 	t.Run("sort fields join fetch but stay out of source", func(t *testing.T) {
 		src := translate.SourceFilter{FetchSource: true, Includes: []string{"name"}}
-		p, err := buildProjection(fields, src, []translate.SortClause{{Field: "price", Desc: true}})
+		p, err := buildProjection(fields, nil, src, []translate.SortClause{{Field: "price", Desc: true}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,12 +101,29 @@ func TestBuildProjection(t *testing.T) {
 		}
 	})
 
+	t.Run("function outputs never join the default projection", func(t *testing.T) {
+		fields := append(fixtureFields(),
+			entity.NewField().WithName("sparse").WithDataType(entity.FieldTypeSparseVector))
+		p, err := buildProjection(fields, []string{"sparse"}, translate.SourceFilter{FetchSource: true}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range p.fetch {
+			if name == "sparse" {
+				t.Errorf("function output %q leaked into fetch: %v", name, p.fetch)
+			}
+		}
+		if len(p.source) != len(p.fetch) {
+			t.Errorf("source %v and fetch %v should agree here", p.source, p.fetch)
+		}
+	})
+
 	t.Run("sort on a non-scalar field fails fast", func(t *testing.T) {
 		src := translate.SourceFilter{FetchSource: true}
-		if _, err := buildProjection(fields, src, []translate.SortClause{{Field: "meta"}}); err == nil {
+		if _, err := buildProjection(fields, nil, src, []translate.SortClause{{Field: "meta"}}); err == nil {
 			t.Fatal("expected error sorting on a JSON field")
 		}
-		if _, err := buildProjection(fields, src, []translate.SortClause{{Field: "ghost"}}); err == nil {
+		if _, err := buildProjection(fields, nil, src, []translate.SortClause{{Field: "ghost"}}); err == nil {
 			t.Fatal("expected error sorting on an unknown field")
 		}
 	})
@@ -208,9 +226,12 @@ func TestJoinAnd(t *testing.T) {
 }
 
 func TestRowsOf(t *testing.T) {
-	rs := client.ResultSet{
-		entity.NewColumnInt64("id", []int64{1, 2}),
-		entity.NewColumnVarChar("name", []string{"a", "b"}),
+	rs := milvusclient.ResultSet{
+		ResultCount: 2,
+		Fields: milvusclient.DataSet{
+			column.NewColumnInt64("id", []int64{1, 2}),
+			column.NewColumnVarChar("name", []string{"a", "b"}),
+		},
 	}
 	rows := rowsOf(rs, []string{"id", "name"})
 	if len(rows) != 2 {
@@ -219,7 +240,7 @@ func TestRowsOf(t *testing.T) {
 	if rows[1]["name"] != "b" || rows[1]["id"] != int64(2) {
 		t.Errorf("row 1 = %v", rows[1])
 	}
-	if rowsOf(nil, []string{"id"}) != nil {
+	if rowsOf(milvusclient.ResultSet{}, []string{"id"}) != nil {
 		t.Error("empty result set should yield no rows")
 	}
 }
