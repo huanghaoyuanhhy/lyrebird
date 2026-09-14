@@ -81,12 +81,16 @@ func (m MapSchema) FieldType(field string) FieldType {
 	return TypeUnknown
 }
 
-// Error is a translation failure with ES-style classification, so protocol
-// layers can render native error envelopes without re-parsing reason strings.
+// Error is a translation failure: one shared three-way classification,
+// rendered in each frontend's native vocabulary, so protocol layers can
+// build native error envelopes without re-parsing reason strings.
 type Error struct {
-	// Type uses ES vocabulary: parsing_exception (malformed DSL),
+	// Type is the frontend's native error name. The es translator fills ES
+	// exception names: parsing_exception (malformed DSL),
 	// illegal_argument_exception (bad values), unsupported_exception
-	// (lyrebird's own: valid request, capability beyond Phase 1).
+	// (lyrebird's own: valid request, capability beyond the current phase).
+	// The pg translator fills SQLSTATE codes over the same classification:
+	// 42601 (syntax), 22023 (invalid value), 0A000 (beyond the subset).
 	Type   string
 	Reason string
 	Status int
