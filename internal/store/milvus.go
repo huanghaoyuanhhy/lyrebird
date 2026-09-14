@@ -8,8 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus-sdk-go/v2/client"
-	"github.com/milvus-io/milvus-sdk-go/v2/entity"
+	"github.com/milvus-io/milvus/client/v2/column"
+	"github.com/milvus-io/milvus/client/v2/entity"
+	"github.com/milvus-io/milvus/client/v2/milvusclient"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
@@ -24,10 +25,11 @@ type MilvusConfig struct {
 }
 
 // MilvusExecutor is the real Executor: it renders plans into Milvus boolean
-// expressions and runs them through milvus-sdk-go. It is the only place in
-// lyrebird that speaks to Milvus.
+// expressions and runs them through the official milvus Go client
+// (milvus-io/milvus/client/v2). It is the only place in lyrebird that
+// speaks to Milvus.
 type MilvusExecutor struct {
-	cli client.Client
+	cli *milvusclient.Client
 }
 
 // compile-time check that MilvusExecutor satisfies Executor.
@@ -36,7 +38,7 @@ var _ Executor = (*MilvusExecutor)(nil)
 // NewMilvusExecutor connects to Milvus and returns an executor. The returned
 // Close releases the connection.
 func NewMilvusExecutor(ctx context.Context, cfg MilvusConfig) (*MilvusExecutor, error) {
-	cli, err := client.NewClient(ctx, client.Config{
+	cli, err := milvusclient.New(ctx, &milvusclient.ClientConfig{
 		Address:       cfg.URI,
 		APIKey:        cfg.Token,
 		EnableTLSAuth: strings.HasPrefix(cfg.URI, "https://"),
@@ -49,7 +51,7 @@ func NewMilvusExecutor(ctx context.Context, cfg MilvusConfig) (*MilvusExecutor, 
 
 // Close releases the Milvus connection.
 func (e *MilvusExecutor) Close(ctx context.Context) error {
-	return e.cli.Close()
+	return e.cli.Close(ctx)
 }
 
 // Schema implements Executor: it describes the collection and maps Milvus
@@ -93,7 +95,7 @@ func (e *MilvusExecutor) Search(ctx context.Context, collection string, plan *tr
 		return nil, fmt.Errorf("collection %q has no primary key field", collection)
 	}
 
-	proj, err := buildProjection(fields, plan.Source, plan.Sort)
+	proj, err := buildProjection(fields, functionOutputFields(coll.Schema), plan.Source, plan.Sort)
 	if err != nil {
 		return nil, err
 	}
@@ -182,8 +184,12 @@ func (e *MilvusExecutor) totalMatches(ctx context.Context, collection, expr stri
 
 // queryPage fetches one window of matches.
 func (e *MilvusExecutor) queryPage(ctx context.Context, collection, expr string, outputFields []string, pkField string, offset, limit int) ([]row, error) {
-	rs, err := e.query(ctx, collection, expr, outputFields,
-		client.WithOffset(int64(offset)), client.WithLimit(int64(limit)))
+	opt := milvusclient.NewQueryOption(collection).
+		WithFilter(expr).
+		WithOutputFields(outputFields...).
+		WithOffset(offset).
+		WithLimit(limit)
+	rs, err := e.queryOpt(ctx, collection, opt)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +250,9 @@ func joinAnd(a, b string) string {
 // count runs the count(*) aggregation, which Milvus only accepts without
 // pagination (verified 2026-09-14).
 func (e *MilvusExecutor) count(ctx context.Context, collection, expr string) (int64, error) {
-	rs, err := e.query(ctx, collection, expr, []string{"count(*)"})
+	rs, err := e.queryOpt(ctx, collection, milvusclient.NewQueryOption(collection).
+		WithFilter(expr).
+		WithOutputFields("count(*)"))
 	if err != nil {
 		return 0, err
 	}
@@ -267,28 +275,39 @@ func (e *MilvusExecutor) count(ctx context.Context, collection, expr string) (in
 // expect every index to be searchable, but Milvus refuses queries against
 // unloaded collections, so a "not loaded" failure triggers LoadCollection
 // (which blocks until progress reaches 100%) and one retry.
-func (e *MilvusExecutor) query(ctx context.Context, collection, expr string, outputFields []string, opts ...client.SearchQueryOptionFunc) (client.ResultSet, error) {
-	rs, err := e.cli.Query(ctx, collection, nil, expr, outputFields, opts...)
+// queryOpt runs one query call; collection is passed separately because the
+// option type keeps its name private.
+func (e *MilvusExecutor) queryOpt(ctx context.Context, collection string, opt milvusclient.QueryOption) (milvusclient.ResultSet, error) {
+	rs, err := e.cli.Query(ctx, opt)
 	if err == nil {
 		return rs, nil
 	}
 	if !strings.Contains(err.Error(), "not loaded") {
-		return nil, fmt.Errorf("query collection %q: %w", collection, err)
+		return milvusclient.ResultSet{}, fmt.Errorf("query collection %q: %w", collection, err)
 	}
-	if err := e.cli.LoadCollection(ctx, collection, false); err != nil {
-		return nil, fmt.Errorf("auto-load collection %q: %w", collection, err)
+	if err := e.loadAndWait(ctx, collection); err != nil {
+		return milvusclient.ResultSet{}, fmt.Errorf("auto-load collection %q: %w", collection, err)
 	}
-	rs, err = e.cli.Query(ctx, collection, nil, expr, outputFields, opts...)
+	rs, err = e.cli.Query(ctx, opt)
 	if err != nil {
-		return nil, fmt.Errorf("query collection %q after auto-load: %w", collection, err)
+		return milvusclient.ResultSet{}, fmt.Errorf("query collection %q after auto-load: %w", collection, err)
 	}
 	return rs, nil
+}
+
+// loadAndWait loads a collection and blocks until it is queryable.
+func (e *MilvusExecutor) loadAndWait(ctx context.Context, collection string) error {
+	task, err := e.cli.LoadCollection(ctx, milvusclient.NewLoadCollectionOption(collection))
+	if err != nil {
+		return err
+	}
+	return task.Await(ctx)
 }
 
 // describe fetches the collection schema, mapping a missing collection to
 // ErrCollectionNotFound so protocol shells can render native 404s.
 func (e *MilvusExecutor) describe(ctx context.Context, collection string) (*entity.Collection, error) {
-	coll, err := e.cli.DescribeCollection(ctx, collection)
+	coll, err := e.cli.DescribeCollection(ctx, milvusclient.NewDescribeCollectionOption(collection))
 	if err != nil {
 		if strings.Contains(err.Error(), "can't find collection") || strings.Contains(err.Error(), "not found") {
 			return nil, fmt.Errorf("%w: %s", ErrCollectionNotFound, collection)
@@ -333,15 +352,29 @@ type projection struct {
 	source []string
 }
 
+// functionOutputFields lists fields generated by schema functions (e.g. the
+// sparse vector a BM25 function produces). Milvus refuses to return their raw
+// data, so they never join the default "every field" projection.
+func functionOutputFields(schema *entity.Schema) []string {
+	var out []string
+	for _, fn := range schema.Functions {
+		out = append(out, fn.OutputFieldNames...)
+	}
+	return out
+}
+
 // buildProjection resolves the plan's SourceFilter against the collection
 // schema. Includes that name unknown fields are dropped silently, the way ES
 // returns an empty _source rather than an error; patterns are limited to the
 // exact / "prefix.*" forms the translator already accepts.
-func buildProjection(fields []*entity.Field, src translate.SourceFilter, sorts []translate.SortClause) (projection, error) {
-	names := make([]string, len(fields))
+func buildProjection(fields []*entity.Field, funcOutputs []string, src translate.SourceFilter, sorts []translate.SortClause) (projection, error) {
+	names := make([]string, 0, len(fields))
 	sortable := make(map[string]bool, len(fields))
-	for i, f := range fields {
-		names[i] = f.Name
+	for _, f := range fields {
+		if isFunctionOutput(f.Name, funcOutputs) {
+			continue // not part of any default projection
+		}
+		names = append(names, f.Name)
 		sortable[f.Name] = isSortableType(f)
 	}
 
@@ -415,6 +448,15 @@ func matchPattern(names []string, pattern string) []string {
 	}
 }
 
+func isFunctionOutput(name string, funcOutputs []string) bool {
+	for _, f := range funcOutputs {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
+
 func isSortableType(f *entity.Field) bool {
 	switch f.DataType {
 	case entity.FieldTypeInt8, entity.FieldTypeInt16, entity.FieldTypeInt32,
@@ -445,12 +487,12 @@ func primaryKey(fields []*entity.Field) *entity.Field {
 }
 
 // rowsOf flattens Milvus's column-major result set into row maps.
-func rowsOf(rs client.ResultSet, outputFields []string) []row {
-	if len(rs) == 0 {
+func rowsOf(rs milvusclient.ResultSet, outputFields []string) []row {
+	if rs.Len() == 0 {
 		return nil
 	}
-	cols := make(map[string]entity.Column, len(rs))
-	for _, col := range rs {
+	cols := make(map[string]column.Column, len(rs.Fields))
+	for _, col := range rs.Fields {
 		cols[col.Name()] = col
 	}
 	rows := make([]row, rs.Len())
