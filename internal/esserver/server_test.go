@@ -1,0 +1,316 @@
+package esserver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"go.uber.org/zap"
+
+	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
+)
+
+// fakeExecutor returns canned results and records what it was asked.
+type fakeExecutor struct {
+	schema translate.Schema
+	result *store.SearchResult
+	err    error
+
+	gotIndex string
+	gotPlan  *translate.Plan
+}
+
+func (f *fakeExecutor) Search(ctx context.Context, collection string, plan *translate.Plan) (*store.SearchResult, error) {
+	f.gotIndex = collection
+	f.gotPlan = plan
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &store.SearchResult{}, f.err
+}
+
+func (f *fakeExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {
+	return f.schema, nil
+}
+
+func serve(t *testing.T, exec store.Executor) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(New(exec, zap.NewNop()))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func searchRequest(t *testing.T, srv *httptest.Server, method, path, body string) (int, map[string]any) {
+	t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("response is not JSON: %v (%s)", err, raw)
+	}
+	return resp.StatusCode, out
+}
+
+func TestSearchEnvelope(t *testing.T) {
+	exec := &fakeExecutor{
+		result: &store.SearchResult{
+			Total: 5,
+			Hits: []store.Hit{
+				{ID: "1", Source: map[string]any{"name": "alpha", "price": 10.5}},
+				{ID: "2", Source: map[string]any{"name": "bravo"}},
+			},
+		},
+	}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/products/_search", `{"query":{"match_all":{}}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", status, body)
+	}
+	if v := body["took"]; v == nil {
+		t.Error("took missing from the envelope")
+	}
+	if body["timed_out"] != false {
+		t.Error("timed_out should be present and false")
+	}
+	if _, ok := body["_shards"]; !ok {
+		t.Error("_shards missing from the envelope")
+	}
+
+	hits := body["hits"].(map[string]any)
+	total := hits["total"].(map[string]any)
+	if total["value"] != float64(5) || total["relation"] != "eq" {
+		t.Errorf("hits.total = %v, want {5 eq}", total)
+	}
+	if hits["max_score"] != 1.0 {
+		t.Errorf("max_score = %v, want 1.0", hits["max_score"])
+	}
+	items := hits["hits"].([]any)
+	first := items[0].(map[string]any)
+	if first["_index"] != "products" || first["_id"] != "1" || first["_score"] != 1.0 {
+		t.Errorf("hit metadata = %v", first)
+	}
+	src := first["_source"].(map[string]any)
+	if src["name"] != "alpha" {
+		t.Errorf("hit _source = %v", src)
+	}
+}
+
+func TestSearchSortedHitsCarryNullScores(t *testing.T) {
+	exec := &fakeExecutor{
+		result: &store.SearchResult{
+			Total: 2,
+			Hits:  []store.Hit{{ID: "1", Source: map[string]any{"price": 20.0}}},
+		},
+	}
+	srv := serve(t, exec)
+
+	_, body := searchRequest(t, srv, http.MethodPost, "/products/_search",
+		`{"query":{"match_all":{}},"sort":[{"price":"desc"}]}`)
+	if exec.gotPlan.Sort[0].Field != "price" || !exec.gotPlan.Sort[0].Desc {
+		t.Errorf("sort did not reach the executor plan: %v", exec.gotPlan.Sort)
+	}
+	hits := body["hits"].(map[string]any)
+	if hits["max_score"] != nil {
+		t.Errorf("max_score = %v, want null for a sorted search", hits["max_score"])
+	}
+	item := hits["hits"].([]any)[0].(map[string]any)
+	if item["_score"] != nil {
+		t.Errorf("_score = %v, want null for a sorted search", item["_score"])
+	}
+}
+
+func TestSearchOmitsSourceWhenFetchSourceFalse(t *testing.T) {
+	exec := &fakeExecutor{
+		result: &store.SearchResult{
+			Total: 1,
+			Hits:  []store.Hit{{ID: "7", Source: nil}},
+		},
+	}
+	srv := serve(t, exec)
+
+	_, body := searchRequest(t, srv, http.MethodPost, "/products/_search",
+		`{"query":{"match_all":{}},"_source":false}`)
+	item := body["hits"].(map[string]any)["hits"].([]any)[0].(map[string]any)
+	if _, ok := item["_source"]; ok {
+		t.Errorf("hit should not carry a _source member: %v", item)
+	}
+}
+
+func TestSearchTranslateErrorsRenderNatively(t *testing.T) {
+	exec := &fakeExecutor{}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/products/_search", `{"from":-1}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d", status)
+	}
+	errBody := body["error"].(map[string]any)
+	if errBody["type"] != "illegal_argument_exception" {
+		t.Errorf("error.type = %v, want illegal_argument_exception", errBody["type"])
+	}
+	if body["status"] != float64(400) {
+		t.Errorf("status member = %v", body["status"])
+	}
+	if errBody["root_cause"] == nil {
+		t.Error("root_cause missing from the error envelope")
+	}
+}
+
+func TestSearchUnsupportedFeatureFailsFast(t *testing.T) {
+	exec := &fakeExecutor{}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/products/_search", `{"aggs":{"by":{"terms":{"field":"x"}}}}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d", status)
+	}
+	if body["error"].(map[string]any)["type"] != "unsupported_exception" {
+		t.Errorf("error.type = %v", body["error"].(map[string]any)["type"])
+	}
+}
+
+func TestSearchMissingIndexRendersIndexNotFound(t *testing.T) {
+	exec := &fakeExecutor{err: store.ErrCollectionNotFound}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/ghosts/_search", `{}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d", status)
+	}
+	errBody := body["error"].(map[string]any)
+	if errBody["type"] != "index_not_found_exception" {
+		t.Errorf("error.type = %v", errBody["type"])
+	}
+	if errBody["index"] != "ghosts" {
+		t.Errorf("error.index = %v", errBody["index"])
+	}
+	if !strings.Contains(errBody["reason"].(string), "no such index [ghosts]") {
+		t.Errorf("reason = %v", errBody["reason"])
+	}
+}
+
+func TestSearchExecutorFailureRendersPhaseError(t *testing.T) {
+	exec := &fakeExecutor{err: errors.New("boom")}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/products/_search", `{}`)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status = %d", status)
+	}
+	if body["error"].(map[string]any)["type"] != "search_phase_execution_exception" {
+		t.Errorf("error.type = %v", body["error"].(map[string]any)["type"])
+	}
+}
+
+func TestSearchRoutesAndParams(t *testing.T) {
+	exec := &fakeExecutor{}
+	srv := serve(t, exec)
+
+	t.Run("GET with source parameter", func(t *testing.T) {
+		status, _ := searchRequest(t, srv, http.MethodGet,
+			"/products/_search?source="+`%7B%22from%22%3A3%7D`, "")
+		if status != http.StatusOK {
+			t.Fatalf("status = %d", status)
+		}
+		if exec.gotPlan.Offset != 3 {
+			t.Errorf("offset = %d, want 3 from the source parameter", exec.gotPlan.Offset)
+		}
+	})
+
+	t.Run("q parameter fails fast", func(t *testing.T) {
+		status, body := searchRequest(t, srv, http.MethodGet, "/products/_search?q=price:10", "")
+		if status != http.StatusBadRequest {
+			t.Fatalf("status = %d", status)
+		}
+		if body["error"].(map[string]any)["type"] != "unsupported_exception" {
+			t.Errorf("error.type = %v", body["error"].(map[string]any)["type"])
+		}
+	})
+
+	t.Run("multi-index path fails fast", func(t *testing.T) {
+		status, body := searchRequest(t, srv, http.MethodPost, "/a,b/_search", `{}`)
+		if status != http.StatusBadRequest {
+			t.Fatalf("status = %d", status)
+		}
+		if body["error"].(map[string]any)["type"] != "unsupported_exception" {
+			t.Errorf("error.type = %v", body["error"].(map[string]any)["type"])
+		}
+	})
+
+	t.Run("size zero search keeps the total", func(t *testing.T) {
+		exec.result = &store.SearchResult{Total: 9}
+		status, body := searchRequest(t, srv, http.MethodPost, "/products/_search", `{"size":0}`)
+		if status != http.StatusOK {
+			t.Fatalf("status = %d", status)
+		}
+		hits := body["hits"].(map[string]any)
+		if hits["total"].(map[string]any)["value"] != float64(9) {
+			t.Errorf("total = %v, want 9", hits["total"])
+		}
+		if got := len(hits["hits"].([]any)); got != 0 {
+			t.Errorf("hits = %d, want 0", got)
+		}
+		if hits["max_score"] != nil {
+			t.Errorf("max_score = %v, want null with no hits", hits["max_score"])
+		}
+	})
+}
+
+func TestClusterInfoKeepsProductHeader(t *testing.T) {
+	srv := serve(t, &fakeExecutor{})
+	resp, err := srv.Client().Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.Header.Get("X-elastic-product") != "Elasticsearch" {
+		t.Errorf("X-elastic-product = %q", resp.Header.Get("X-elastic-product"))
+	}
+}
+
+func TestPanicRecoveryReturnsEnvelope(t *testing.T) {
+	// A panicking executor must surface as a 500 envelope, not a dropped
+	// connection.
+	exec := panickyExecutor{}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/products/_search", `{}`)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status = %d", status)
+	}
+	if body["error"].(map[string]any)["type"] != "lyrebird_error" {
+		t.Errorf("error.type = %v", body["error"].(map[string]any)["type"])
+	}
+}
+
+type panickyExecutor struct{}
+
+func (panickyExecutor) Search(ctx context.Context, collection string, plan *translate.Plan) (*store.SearchResult, error) {
+	panic("boom")
+}
+
+func (panickyExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {
+	return translate.MapSchema{}, nil
+}
