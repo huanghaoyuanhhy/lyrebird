@@ -161,6 +161,25 @@ func TestEsserverFullStackE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("match on analyzed text goes through the gateway", func(t *testing.T) {
+		res := roundtrip(t, srv, http.MethodPost, milvustest.TextCollection+"/_search",
+			`{"query":{"match":{"body":"quick brown"}}}`, http.StatusOK)
+		hits := res["hits"].(map[string]any)
+		// TEXT_MATCH ORs tokens: quick → docs 1,4,5; brown → docs 1,2
+		if hits["total"].(map[string]any)["value"] != float64(4) {
+			t.Errorf("total = %v, want 4", hits["total"])
+		}
+		items := hits["hits"].([]any)
+		first := items[0].(map[string]any)
+		if first["_score"] != 1.0 {
+			t.Errorf("_score = %v, want the constant 1.0 until Phase 5", first["_score"])
+		}
+		body := first["_source"].(map[string]any)["body"].(string)
+		if !strings.Contains(body, "quick") && !strings.Contains(body, "brown") {
+			t.Errorf("hit body = %q, should contain a matched token", body)
+		}
+	})
+
 	t.Run("GET search with source parameter", func(t *testing.T) {
 		path := milvustest.Collection + "/_search?source=" + `%7B%22size%22%3A0%7D`
 		res := roundtrip(t, srv, http.MethodGet, path, "", http.StatusOK)
