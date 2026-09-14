@@ -97,6 +97,40 @@
 - Known approximations (documented in code): match tokenization is whitespace-only until
   Phase 5; `minimum_should_match > 1` needs k-of-n matching, unsupported for now.
 
+## Settled — store capability facts on the target cluster (2026-09-14)
+
+Verified against the development Zilliz Cloud endpoint ("Compatible with
+Milvus 2.6") with milvus-sdk-go v2.4.2:
+
+- **No query-side ORDER BY.** `order by` suffixes in the query expression are
+  rejected by the plan parser, and SDK v2.4.2 exposes no orderBy option, so
+  sorts stay client-side: the executor streams every match through a
+  primary-key cursor (`(filter) and pk > last`, 1000/batch), sorts, windows.
+  Decision 4 flips only when a 3.x server is the target. The SDK's own
+  QueryIterator composes the same cursor but sends iterator parameters this
+  server rejects (EOF) — lyrebird drives plain queries instead.
+- **count(*) works, but not with pagination** ("count entities with pagination
+  is not allowed"), so totals are a separate no-paging query. It is skipped
+  when the answer is already exact: full-scan (sort) paths and underfilled
+  pages (`offset + len` is the total).
+- **limit 0 is rejected server-side**, so ES `size: 0` becomes a count-only
+  search (no page fetch at all).
+- Empty expression = match-all, with offset/limit, works. `is null` /
+  `is not null` work on plain (non-nullable-declared) fields — the
+  `exists` mapping is safe at read time even though the collections lyrebird
+  can create via this SDK cannot declare nullable fields.
+- Query results always include the primary key column, requested or not.
+- Offset past the total returns zero rows (ES-compatible), not an error.
+- Known SDK gaps (v2.4.2): no nullable-field creation/description, no BM25
+  Function schema — both only matter for DDL (Phase 3) and fixture
+  provisioning, not the read path. The newer `milvus-io/milvus/client/v2`
+  has them but drags the whole server monorepo into go.mod (~120 indirect
+  deps: etcd, raft, k8s, otel); revisit at Phase 3 — the SDK is hidden
+  behind Executor, so switching touches only internal/store.
+- The plan contract's `Source.FetchSource` zero value means "no source";
+  translators must default it to true (parseSource does). Documented on the
+  Plan to keep the pg translator honest.
+
 ## Settled — IR placement: query-level IR stays frontend-private (2026-09-13)
 
 - Layering, top to bottom: **query-level IR is per-frontend** (es: the hand-rolled

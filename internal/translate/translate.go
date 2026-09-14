@@ -23,6 +23,11 @@ type Plan struct {
 	Sort []SortClause
 
 	// Source controls which fields are fetched and returned.
+	//
+	// FetchSource false means hits carry no source at all (ES _source: false).
+	// The boolean's zero value is false, so translators MUST default it to
+	// true (the ES default) — a Plan built from a bare Plan{} literal yields
+	// _id-only hits. parseSource does this; keep the pg translator honest too.
 	Source SourceFilter
 
 	// NoMatch marks a query that cannot match anything (e.g. bool with
