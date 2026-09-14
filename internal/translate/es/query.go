@@ -122,8 +122,27 @@ func parseQueryClause(name string, body json.RawMessage) (queryNode, error) {
 	case "exists":
 		return parseExists(body)
 	default:
+		// Known ES queries (multi_match, query_string, ...) are valid DSL
+		// beyond the Phase 1 surface — unsupported_exception, not a parse
+		// error. Truly unknown names stay parsing exceptions.
+		if knownQueryNames[name] {
+			return nil, unsupportedErrf("[%s] query is beyond lyrebird's Phase 1 surface", name)
+		}
 		return nil, parseErrf("unknown query [%s]", name)
 	}
+}
+
+// knownQueryNames covers the rest of ES's query family so valid DSL gets the
+// "beyond Phase 1" classification while typos still read as parse errors.
+var knownQueryNames = map[string]bool{
+	"multi_match": true, "query_string": true, "simple_query_string": true,
+	"match_phrase": true, "match_phrase_prefix": true, "match_bool_prefix": true,
+	"prefix": true, "wildcard": true, "regexp": true, "fuzzy": true,
+	"ids": true, "constant_score": true, "dis_max": true, "boosting": true,
+	"function_score": true, "nested": true, "geo_distance": true,
+	"geo_bounding_box": true, "more_like_this": true, "percolate": true,
+	"rank_feature": true, "distance_feature": true, "pinned": true,
+	"knn": true, "combined_fields": true, "intervals": true, "span_near": true,
 }
 
 func parseBool(body json.RawMessage) (queryNode, error) {
@@ -417,9 +436,9 @@ func fold(n queryNode) (queryNode, error) {
 			return matchNone{}, nil
 		case len(b.should) > 0 && msm > 1:
 			return nil, unsupportedErrf("[bool] minimum_should_match > 1 is not supported yet (needs k-of-n matching)")
-		case len(b.should) == 0 && hadNone && msm >= 1 &&
-			len(b.must) == 0 && len(b.filter) == 0:
-			// OR over only-impossible clauses matches nothing
+		case len(b.should) == 0 && hadNone && msm >= 1:
+			// every should clause was impossible, so msm can never be met —
+			// even alongside must/filter, whose match cannot rescue the OR
 			return matchNone{}, nil
 		}
 	}
