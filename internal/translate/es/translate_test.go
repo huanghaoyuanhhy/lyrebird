@@ -252,6 +252,24 @@ func TestTranslate(t *testing.T) {
 			},
 		},
 		{
+			name: "sort single string form",
+			body: `{"sort": "views"}`,
+			want: &translate.Plan{
+				Limit:  10,
+				Source: translate.SourceFilter{FetchSource: true},
+				Sort:   []translate.SortClause{{Field: "views"}},
+			},
+		},
+		{
+			name: "sort single object form",
+			body: `{"sort": {"views": "desc"}}`,
+			want: &translate.Plan{
+				Limit:  10,
+				Source: translate.SourceFilter{FetchSource: true},
+				Sort:   []translate.SortClause{{Field: "views", Desc: true}},
+			},
+		},
+		{
 			name: "sort on _score is dropped",
 			body: `{"sort": ["_score", {"views": "desc"}]}`,
 			want: &translate.Plan{
