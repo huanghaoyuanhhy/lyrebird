@@ -121,12 +121,17 @@ Milvus 2.6") with milvus-sdk-go v2.4.2:
   can create via this SDK cannot declare nullable fields.
 - Query results always include the primary key column, requested or not.
 - Offset past the total returns zero rows (ES-compatible), not an error.
-- Known SDK gaps (v2.4.2): no nullable-field creation/description, no BM25
-  Function schema — both only matter for DDL (Phase 3) and fixture
-  provisioning, not the read path. The newer `milvus-io/milvus/client/v2`
-  has them but drags the whole server monorepo into go.mod (~120 indirect
-  deps: etcd, raft, k8s, otel); revisit at Phase 3 — the SDK is hidden
-  behind Executor, so switching touches only internal/store.
+- **SDK: `milvus-io/milvus/client/v2` v2.6.5** (settled 2026-09-15). Started
+  on classic milvus-sdk-go v2.4.2 for its lean dependency tree; switched at
+  the user's call once it mattered more to track the live SDK — the server
+  monorepo arrives as indirect deps (etcd, raft, k8s, otel, ~120 modules),
+  accepted. Gains exercised for real: nullable-field creation and
+  description (exists e2e now covers the null side), BM25 Function schema
+  (match → TEXT_MATCH is e2e-verified). Two DDL facts surfaced: TEXT_MATCH
+  needs `enable_analyzer` AND `enable_match` on the text field, and Milvus
+  refuses raw retrieval of function outputs (sparse), so those fields are
+  excluded from the default projection. The SDK stays behind Executor —
+  only internal/store imports it.
 - The plan contract's `Source.FetchSource` zero value means "no source";
   translators must default it to true (parseSource does). Documented on the
   Plan to keep the pg translator honest.
