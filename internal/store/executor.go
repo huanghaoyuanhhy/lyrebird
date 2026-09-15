@@ -16,6 +16,12 @@ import (
 // names (ES index, PG table) before calling in.
 type Executor interface {
 	Search(ctx context.Context, collection string, plan *translate.Plan) (*SearchResult, error)
+
+	// Schema answers field-type questions for the collection, as seen by the
+	// backing store. Translators call it before parsing so type-sensitive
+	// choices (match → exact compare vs token match) follow the real fields;
+	// absent fields read as translate.TypeUnknown.
+	Schema(ctx context.Context, collection string) (translate.Schema, error)
 }
 
 // Hit is one matched entity: its primary key and the fields fetched for it.
@@ -41,6 +47,12 @@ type LogExecutor struct {
 	// Logger receives one structured entry per search; nil uses the global
 	// zap.L() (wired by zap.ReplaceGlobals in main).
 	Logger *zap.Logger
+}
+
+// Schema implements Executor: the stand-in knows no fields, so every lookup
+// reads as unknown — the same answer as a real collection with no fields.
+func (e *LogExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {
+	return translate.MapSchema{}, nil
 }
 
 // Search implements Executor. Render errors are returned, not swallowed:

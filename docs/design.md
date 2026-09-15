@@ -64,7 +64,8 @@
 - Prior art: Quickwit / Zincsearch implemented ES `_search` subset compatibility — worth
   browsing which endpoints they support
 - PG-side low-level fallback: `jackc/pgx` v5's pgproto3 subpackage (if psql-wire falls short)
-- Outbound access goes through `milvus-sdk-go`, no hand-rolled gRPC
+- Outbound access goes through the official Go client from the milvus repo
+  (`milvus-io/milvus/client/v2`), no hand-rolled gRPC
 
 ## Settled — Phase 1 translation slice (2026-09-11)
 
@@ -96,6 +97,47 @@
   offset+size and sort client-side within that window.
 - Known approximations (documented in code): match tokenization is whitespace-only until
   Phase 5; `minimum_should_match > 1` needs k-of-n matching, unsupported for now.
+
+## Settled — store capability facts on the target cluster (2026-09-14)
+
+Verified against the development Zilliz Cloud endpoint ("Compatible with
+Milvus 2.6"): first probed on classic milvus-sdk-go v2.4.2, then
+re-confirmed by the e2e suite now running on `client/v2` v2.6.5:
+
+- **No query-side ORDER BY.** `order by` suffixes in the query expression are
+  rejected by the plan parser, and neither client exposes an orderBy option,
+  so sorts stay client-side: the executor streams every match through a
+  primary-key cursor (`(filter) and pk > last`, 1000/batch), sorts, windows.
+  Decision 4 flips only when a 3.x server is the target. The classic SDK's
+  QueryIterator composes the same cursor but sends iterator parameters this
+  server rejects (EOF) — lyrebird drives plain queries and relies on no
+  SDK iterator.
+- **count(*) works, but not with pagination** ("count entities with pagination
+  is not allowed"), so totals are a separate no-paging query. It is skipped
+  when the answer is already exact: full-scan (sort) paths and underfilled
+  pages (`offset + len` is the total).
+- **limit 0 is rejected server-side**, so ES `size: 0` becomes a count-only
+  search (no page fetch at all).
+- Empty expression = match-all, with offset/limit, works. `is null` /
+  `is not null` work on nullable and non-nullable fields alike — verified
+  against a fixture with a nullable column (null side included), so the
+  `exists` mapping holds both ways.
+- Query results always include the primary key column, requested or not.
+- Offset past the total returns zero rows (ES-compatible), not an error.
+- **SDK: `milvus-io/milvus/client/v2` v2.6.5** (settled 2026-09-15). Started
+  on classic milvus-sdk-go v2.4.2 for its lean dependency tree; switched at
+  the user's call once it mattered more to track the live SDK — the server
+  monorepo arrives as indirect deps (etcd, raft, k8s, otel, ~120 modules),
+  accepted. Gains exercised for real: nullable-field creation and
+  description (exists e2e now covers the null side), BM25 Function schema
+  (match → TEXT_MATCH is e2e-verified). Two DDL facts surfaced: TEXT_MATCH
+  needs `enable_analyzer` AND `enable_match` on the text field, and Milvus
+  refuses raw retrieval of function outputs (sparse), so those fields are
+  excluded from the default projection. The SDK stays behind Executor —
+  only internal/store imports it.
+- The plan contract's `Source.FetchSource` zero value means "no source";
+  translators must default it to true (parseSource does). Documented on the
+  Plan to keep the pg translator honest.
 
 ## Settled — IR placement: query-level IR stays frontend-private (2026-09-13)
 
