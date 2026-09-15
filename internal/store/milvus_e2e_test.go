@@ -202,11 +202,17 @@ func TestMilvusExecutorE2E(t *testing.T) {
 
 	t.Run("negated exists matches the null side", func(t *testing.T) {
 		res := mustSearch(t, ctx, exec, &translate.Plan{
-			Expr:  translate.Not{Child: translate.NotNull{Field: "note"}},
-			Limit: 10,
+			Expr:   translate.Not{Child: translate.NotNull{Field: "note"}},
+			Limit:  10,
+			Source: fetchSource(),
 		})
 		if res.Total != 2 {
 			t.Errorf("total=%d, want 2 (the null-note rows)", res.Total)
+		}
+		for _, h := range res.Hits {
+			if v, present := h.Source["note"]; !present || v != nil {
+				t.Errorf("hit %s should carry a null note, got %v (present=%v)", h.ID, v, present)
+			}
 		}
 	})
 

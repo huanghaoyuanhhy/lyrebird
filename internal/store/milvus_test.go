@@ -244,3 +244,24 @@ func TestRowsOf(t *testing.T) {
 		t.Error("empty result set should yield no rows")
 	}
 }
+
+func TestRowsOfNullableColumn(t *testing.T) {
+	// compact encoding: values hold only the non-null entries, validData is
+	// full-length and marks the nulls
+	col, err := column.NewNullableColumnVarChar("note",
+		[]string{"alpha note", "charlie note"}, []bool{true, false, true, false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := milvusclient.ResultSet{
+		ResultCount: 4,
+		Fields:      milvusclient.DataSet{column.NewColumnInt64("id", []int64{1, 2, 3, 4}), col},
+	}
+	rows := rowsOf(rs, []string{"id", "note"})
+	if rows[0]["note"] != "alpha note" || rows[2]["note"] != "charlie note" {
+		t.Errorf("valid cells wrong: %v", rows)
+	}
+	if rows[1]["note"] != nil || rows[3]["note"] != nil {
+		t.Errorf("null cells should read as nil, got %v", rows)
+	}
+}

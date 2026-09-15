@@ -506,12 +506,29 @@ func rowsOf(rs milvusclient.ResultSet, outputFields []string) []row {
 			v, err := col.Get(i)
 			if err != nil {
 				v = nil // treat unreadable cell as missing
+			} else if isNull(col, i) {
+				v = nil // nullable column, null cell → JSON null, not zero value
 			}
 			r[name] = v
 		}
 		rows[i] = r
 	}
 	return rows
+}
+
+// nullableColumn is the optional null introspection columns carry; Get
+// returns the zero value for a null cell, so nullness needs IsNull.
+type nullableColumn interface {
+	IsNull(idx int) (bool, error)
+}
+
+func isNull(col column.Column, idx int) bool {
+	nc, ok := col.(nullableColumn)
+	if !ok {
+		return false
+	}
+	isNull, err := nc.IsNull(idx)
+	return err == nil && isNull
 }
 
 // hitID renders the primary key as the string an ES client sees as _id.
