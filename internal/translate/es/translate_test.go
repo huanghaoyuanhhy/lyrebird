@@ -228,6 +228,17 @@ func TestTranslate(t *testing.T) {
 			want: baseNoMatch(),
 		},
 		{
+			name: "explicit msm over an impossible should fails closed even with must",
+			body: `{"query": {"bool": {"must": [{"term": {"status": "a"}}], "should": [{"match_none": {}}], "minimum_should_match": 1}}}`,
+			want: baseNoMatch(),
+		},
+		{
+			name: "default msm ignores impossible optional should",
+			body: `{"query": {"bool": {"must": [{"term": {"status": "a"}}], "should": [{"match_none": {}}]}}}`,
+			want: basePlan(),
+			expr: `status == "a"`,
+		},
+		{
 			name: "term values escape quotes and backslashes",
 			body: `{"query": {"term": {"status": "a\"b\\c"}}}`,
 			want: basePlan(),
@@ -415,9 +426,20 @@ func TestTranslateErrors(t *testing.T) {
 		},
 		{
 			name:       "unknown query type",
-			body:       `{"query": {"fuzzy": {"title": "x"}}}`,
+			body:       `{"query": {"no_such_query": {"title": "x"}}}`,
 			wantType:   "parsing_exception",
-			wantReason: "unknown query [fuzzy]",
+			wantReason: "unknown query [no_such_query]",
+		},
+		{
+			name:       "known but unsupported query type",
+			body:       `{"query": {"multi_match": {"query": "x", "fields": ["a", "b"]}}}`,
+			wantType:   "unsupported_exception",
+			wantReason: "[multi_match]",
+		},
+		{
+			name:     "fuzzy query is unsupported, not a parse error",
+			body:     `{"query": {"fuzzy": {"title": "x"}}}`,
+			wantType: "unsupported_exception",
 		},
 		{
 			name:       "aggregations fail fast",

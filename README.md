@@ -45,11 +45,12 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
 
 - [x] **Phase 0** Skeleton: ES entry answers the `GET /` handshake (with the
   `X-elastic-product` header), `_search` returns 501
-- [ ] **Phase 1** ES read-only subset: `_search` + bool/term/terms/match/range/exists +
+- [x] **Phase 1** ES read-only subset: `_search` + bool/term/terms/match/range/exists +
   sort/size/from + `_source` projection
   - [x] translation layer (`internal/translate/es`: DSL → `translate.Plan`, pure
     functions + unit tests)
-  - [ ] store wiring: Milvus client executes the plan; `_search` endpoint activation
+  - [x] store wiring: Milvus client executes the plan (`internal/store`), `_search`
+    endpoint live (`internal/esserver`)
 - [ ] **Phase 2** PG read-only subset: wire protocol up, psql connects,
   `SELECT .. WHERE .. LIMIT` translation
 - [ ] **Phase 3** Schema catalog: config-driven mapping + describe-based discovery;
@@ -70,5 +71,13 @@ See [docs/design.md](docs/design.md) for design details and decision points.
 ```bash
 make run     # ES entry point at 127.0.0.1:9200 by default
 curl 127.0.0.1:9200/          # handshake
-curl -XPOST 127.0.0.1:9200/idx/_search -d '{"query":{"match_all":{}}}'   # 501
+# without --milvus-uri the gateway logs searches and returns empty results
+go run ./cmd/gateway --milvus-uri 'https://host:19530' --milvus-token 'KEY'
+curl -XPOST 127.0.0.1:9200/idx/_search \
+  -d '{"query":{"range":{"price":{"gte":10}}},"sort":[{"price":"desc"}],"from":0,"size":5}'
 ```
+
+The e2e suites (`internal/store`, `internal/esserver`) run against a real
+Milvus/Zilliz Cloud instance when `LYREBIRD_TEST_MILVUS_URI` and
+`LYREBIRD_TEST_MILVUS_TOKEN` are set, and skip otherwise — credentials stay
+out of the repo.

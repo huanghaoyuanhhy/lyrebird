@@ -4,13 +4,16 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/esserver"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 )
 
 func main() {
@@ -20,7 +23,7 @@ func main() {
 }
 
 func newRootCommand() *cobra.Command {
-	var esAddr, pgAddr string
+	var esAddr, pgAddr, milvusURI, milvusToken string
 
 	cmd := &cobra.Command{
 		Use:   "lyrebird",
@@ -36,14 +39,34 @@ func newRootCommand() *cobra.Command {
 			defer logger.Sync()
 			zap.ReplaceGlobals(logger)
 
+			exec, err := buildExecutor(cmd.Context(), milvusURI, milvusToken, logger)
+			if err != nil {
+				return err
+			}
+
 			logger.Info("pg wire entry point not implemented yet (Phase 2)", zap.String("addr", pgAddr))
 			logger.Info("ES-compatible entry point listening", zap.String("addr", esAddr))
-			return http.ListenAndServe(esAddr, esserver.New())
+			return http.ListenAndServe(esAddr, esserver.New(exec, logger))
 		},
 	}
 
 	cmd.Flags().StringVar(&esAddr, "es-addr", "127.0.0.1:9200", "Elasticsearch-compatible entry point listen address")
 	cmd.Flags().StringVar(&pgAddr, "pg-addr", "127.0.0.1:5433", "PostgreSQL wire entry point listen address (placeholder until Phase 2)")
+	cmd.Flags().StringVar(&milvusURI, "milvus-uri", "", "Milvus/Zilliz Cloud endpoint (https://host:19530); empty runs the log-only dev executor")
+	cmd.Flags().StringVar(&milvusToken, "milvus-token", "", "Milvus auth token (API key or user:password)")
 
 	return cmd
+}
+
+// buildExecutor picks the backing store: the real Milvus executor when an
+// endpoint is configured, the log stand-in otherwise so the gateway still
+// boots for development.
+func buildExecutor(ctx context.Context, uri, token string, logger *zap.Logger) (store.Executor, error) {
+	if uri == "" {
+		logger.Info("no --milvus-uri given; searches will log and return empty results")
+		return &store.LogExecutor{Logger: logger}, nil
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return store.NewMilvusExecutor(connectCtx, store.MilvusConfig{URI: uri, Token: token})
 }
