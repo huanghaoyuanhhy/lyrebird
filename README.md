@@ -18,11 +18,31 @@ One Milvus cluster, three entry points:
 | Milvus       | native gRPC/SDK       | no gateway, direct access |
 
 ```
-psql ─── SQL ───┐
-                │  translate(pure fn)   ┌──────────┐
-es sdk ── DSL ──┼──────────────────────▶│  Milvus  │
-                │                       └──────────┘
+psql ─── SQL ───┐                 es sdk ─── DSL ───┐
+               ▼                                    ▼
+         pg.Parse(sql)                 es.Translate(body, schema)
+               │                                    │
+        Select (pg IR)                      queryNode (es IR)
+               │                                    │
+             fold                                 fold
+               │                                    │
+      Select.Plan(schema)                   buildExpr(schema)
+               │                                    │
+               └──────────────────┬─────────────────┘
+                                  ▼
+                           translate.Plan
+                                  │
+               store.Executor.Search(collection, plan)
+                                  │
+                               Milvus
 ```
+
+Each frontend parses into its own private IR (pg `Select`, es `queryNode`),
+constant-folds it, then lowers schema-aware into the one shared
+`translate.Plan` — a plain data structure (filter Expr tree, sort, paging,
+`_source`) that deliberately carries no collection name. Schema comes from
+`store.Executor.Schema` before lowering (URL index for ES, `Select.Table`
+for PG); the store executes plan + collection against Milvus.
 
 ## Architecture
 
@@ -31,14 +51,14 @@ cmd/gateway              entry point: start listener(s)
 internal/pgserver        PG wire protocol server (Phase 2)
 internal/esserver        ES-compatible REST server (Phase 1)
 internal/translate
-    ├─ pg/               SQL → Milvus query/search
-    └─ es/               ES Query DSL → Milvus query/search
-internal/store           Milvus client wrapper + schema catalog (table/index → collection)
+    ├─ pg/               SQL → Select (IR) → fold → Plan
+    └─ es/               ES Query DSL → queryNode (IR) → fold → Plan
+internal/store           Milvus Executor: Schema(collection) + Search(collection, plan)
 ```
 
-Principle: **the translation layer is a pure function** `(protocol request, schema) → Milvus
-operations` — no IO, everything covered by golden-file unit tests. The protocol layer only
-handles encoding/decoding; the store layer only executes. Queries beyond the supported
+Principle: **the translation layer is pure functions** — parse → private IR →
+fold → `translate.Plan`, no IO, everything covered by unit tests. The protocol
+layer only handles encoding/decoding; the store layer only executes. Queries beyond the supported
 capability set (joins, aggregations) fail fast with an error — no degraded emulation.
 
 ## Roadmap
