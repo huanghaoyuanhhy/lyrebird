@@ -5,14 +5,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/esserver"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/pgserver"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 )
 
@@ -44,14 +48,38 @@ func newRootCommand() *cobra.Command {
 				return err
 			}
 
-			logger.Info("pg wire entry point not implemented yet (Phase 2)", zap.String("addr", pgAddr))
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			// The ES front is the primary process: it owns the run error and
+			// outlives the pg front's shutdown on Ctrl-C.
+			pgSrv := pgserver.New(exec, logger)
+			pgErr := make(chan error, 1)
+			go func() { pgErr <- pgSrv.ListenAndServe(ctx, pgAddr) }()
+
+			httpSrv := &http.Server{Addr: esAddr, Handler: esserver.New(exec, logger)}
+			go func() {
+				<-ctx.Done()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = httpSrv.Shutdown(shutdownCtx)
+			}()
+
 			logger.Info("ES-compatible entry point listening", zap.String("addr", esAddr))
-			return http.ListenAndServe(esAddr, esserver.New(exec, logger))
+			runErr := httpSrv.ListenAndServe()
+			stop() // the pg front shuts down on the same signal
+			if pgWaitErr := <-pgErr; pgWaitErr != nil && runErr == nil {
+				runErr = pgWaitErr
+			}
+			if errors.Is(runErr, http.ErrServerClosed) {
+				return nil
+			}
+			return runErr
 		},
 	}
 
 	cmd.Flags().StringVar(&esAddr, "es-addr", "127.0.0.1:9200", "Elasticsearch-compatible entry point listen address")
-	cmd.Flags().StringVar(&pgAddr, "pg-addr", "127.0.0.1:5433", "PostgreSQL wire entry point listen address (placeholder until Phase 2)")
+	cmd.Flags().StringVar(&pgAddr, "pg-addr", "127.0.0.1:5433", "PostgreSQL wire entry point listen address")
 	cmd.Flags().StringVar(&milvusURI, "milvus-uri", "", "Milvus/Zilliz Cloud endpoint (https://host:19530); empty runs the log-only dev executor")
 	cmd.Flags().StringVar(&milvusToken, "milvus-token", "", "Milvus auth token (API key or user:password)")
 

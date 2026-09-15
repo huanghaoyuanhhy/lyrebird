@@ -71,8 +71,13 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
     functions + unit tests)
   - [x] store wiring: Milvus client executes the plan (`internal/store`), `_search`
     endpoint live (`internal/esserver`)
-- [ ] **Phase 2** PG read-only subset: wire protocol up, psql connects,
+- [x] **Phase 2** PG read-only subset: wire protocol up, psql connects,
   `SELECT .. WHERE .. LIMIT` translation
+  - [x] translation layer (`internal/translate/pg`: SQL → `Select` →
+    `translate.Plan`, pure functions + unit tests)
+  - [x] wiring: PG wire protocol server (`internal/pgserver`, on
+    jeroenrinzema/psql-wire) executes plans through `internal/store`;
+    translate errors render as native SQLSTATEs, LIMIT stays mandatory
 - [ ] **Phase 3** Schema catalog: config-driven mapping + describe-based discovery;
   DDL (CREATE TABLE → CreateCollection)
 - [ ] **Phase 4** Write path: insert/update/delete → upsert/delete

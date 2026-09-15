@@ -143,6 +143,20 @@ var unsupportedClauses = map[string]bool{
 	"FOR": true, "FETCH": true, "INTO": true,
 }
 
+// Columns resolves the projected column list: the named columns in written
+// order, or — for SELECT * — every field the schema knows, in storage order.
+// The wire layer needs this before executing: RowDescription precedes the
+// rows it describes, so the star cannot wait for the store's answer.
+func (s *Select) Columns(schema translate.Schema) []string {
+	if !s.star {
+		return append([]string{}, s.columns...)
+	}
+	if schema == nil {
+		return nil
+	}
+	return schema.Fields()
+}
+
 // Plan lowers the statement into a store-executable plan. schema answers
 // field-type questions for Select.Table (Executor.Schema); nil treats every
 // field as unknown, enough until the Phase 3 schema catalog.

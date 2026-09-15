@@ -61,11 +61,33 @@ func (e *MilvusExecutor) Schema(ctx context.Context, collection string) (transla
 	if err != nil {
 		return nil, err
 	}
-	schema := translate.MapSchema{}
+	funcOutputs := functionOutputFields(coll.Schema)
+	schema := collectionSchema{types: translate.MapSchema{}}
 	for _, f := range coll.Schema.Fields {
-		schema[f.Name] = translateFieldType(f)
+		if isFunctionOutput(f.Name, funcOutputs) {
+			continue // Milvus refuses to return their raw data (see buildProjection)
+		}
+		schema.names = append(schema.names, f.Name)
+		schema.types[f.Name] = translateFieldType(f)
 	}
 	return schema, nil
+}
+
+// collectionSchema is a described collection's field view: types follow the
+// translate vocabulary, names keep the collection's storage order so SELECT *
+// expands the way the fields were declared.
+type collectionSchema struct {
+	names []string
+	types translate.MapSchema
+}
+
+func (s collectionSchema) FieldType(field string) translate.FieldType {
+	return s.types.FieldType(field)
+}
+
+// Fields implements translate.Schema, in storage order.
+func (s collectionSchema) Fields() []string {
+	return append([]string{}, s.names...)
 }
 
 // Search implements Executor. Execution shape per plan:

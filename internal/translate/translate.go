@@ -1,6 +1,9 @@
 package translate
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // Plan is the protocol-agnostic result of translation: everything the store
 // layer needs to execute a read against Milvus, and nothing protocol-specific.
@@ -69,9 +72,14 @@ const (
 	TypeUnknown FieldType = "unknown"
 )
 
-// Schema answers field-type questions for the translators.
+// Schema answers field questions for the translators: types for WHERE
+// lowering, and the field list for expanding SELECT * (whose columns must
+// be known before execution — the PG wire describes them ahead of the rows).
+// Fields returns names in storage order when the implementation has one;
+// implementations without order (MapSchema) sort alphabetically.
 type Schema interface {
 	FieldType(field string) FieldType
+	Fields() []string
 }
 
 // MapSchema is a Schema backed by a plain map; absent fields are unknown.
@@ -84,6 +92,17 @@ func (m MapSchema) FieldType(field string) FieldType {
 		return t
 	}
 	return TypeUnknown
+}
+
+// Fields implements Schema: the map's keys, sorted so consumers get a
+// stable order out of an unordered type.
+func (m MapSchema) Fields() []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Error is a translation failure: one shared three-way classification,
