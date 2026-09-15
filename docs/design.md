@@ -64,7 +64,8 @@
 - Prior art: Quickwit / Zincsearch implemented ES `_search` subset compatibility — worth
   browsing which endpoints they support
 - PG-side low-level fallback: `jackc/pgx` v5's pgproto3 subpackage (if psql-wire falls short)
-- Outbound access goes through `milvus-sdk-go`, no hand-rolled gRPC
+- Outbound access goes through the official Go client from the milvus repo
+  (`milvus-io/milvus/client/v2`), no hand-rolled gRPC
 
 ## Settled — Phase 1 translation slice (2026-09-11)
 
@@ -100,15 +101,17 @@
 ## Settled — store capability facts on the target cluster (2026-09-14)
 
 Verified against the development Zilliz Cloud endpoint ("Compatible with
-Milvus 2.6") with milvus-sdk-go v2.4.2:
+Milvus 2.6"): first probed on classic milvus-sdk-go v2.4.2, then
+re-confirmed by the e2e suite now running on `client/v2` v2.6.5:
 
 - **No query-side ORDER BY.** `order by` suffixes in the query expression are
-  rejected by the plan parser, and SDK v2.4.2 exposes no orderBy option, so
-  sorts stay client-side: the executor streams every match through a
+  rejected by the plan parser, and neither client exposes an orderBy option,
+  so sorts stay client-side: the executor streams every match through a
   primary-key cursor (`(filter) and pk > last`, 1000/batch), sorts, windows.
-  Decision 4 flips only when a 3.x server is the target. The SDK's own
+  Decision 4 flips only when a 3.x server is the target. The classic SDK's
   QueryIterator composes the same cursor but sends iterator parameters this
-  server rejects (EOF) — lyrebird drives plain queries instead.
+  server rejects (EOF) — lyrebird drives plain queries and relies on no
+  SDK iterator.
 - **count(*) works, but not with pagination** ("count entities with pagination
   is not allowed"), so totals are a separate no-paging query. It is skipped
   when the answer is already exact: full-scan (sort) paths and underfilled
@@ -116,9 +119,9 @@ Milvus 2.6") with milvus-sdk-go v2.4.2:
 - **limit 0 is rejected server-side**, so ES `size: 0` becomes a count-only
   search (no page fetch at all).
 - Empty expression = match-all, with offset/limit, works. `is null` /
-  `is not null` work on plain (non-nullable-declared) fields — the
-  `exists` mapping is safe at read time even though the collections lyrebird
-  can create via this SDK cannot declare nullable fields.
+  `is not null` work on nullable and non-nullable fields alike — verified
+  against a fixture with a nullable column (null side included), so the
+  `exists` mapping holds both ways.
 - Query results always include the primary key column, requested or not.
 - Offset past the total returns zero rows (ES-compatible), not an error.
 - **SDK: `milvus-io/milvus/client/v2` v2.6.5** (settled 2026-09-15). Started
