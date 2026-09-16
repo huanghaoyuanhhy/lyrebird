@@ -62,6 +62,7 @@ func TestPgserverFullStackE2E(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				defer rows.Close()
 				fields := rows.FieldDescriptions()
 				want := []string{"id", "name", "price", "qty", "active", "created_ms", "note", "emb"}
 				if len(fields) != len(want) {
@@ -95,6 +96,7 @@ func TestPgserverFullStackE2E(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				defer rows.Close()
 				var got []string
 				for rows.Next() {
 					var name string
@@ -123,6 +125,7 @@ func TestPgserverFullStackE2E(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				defer rows.Close()
 				var ids []int64
 				for rows.Next() {
 					var id int64
@@ -145,6 +148,7 @@ func TestPgserverFullStackE2E(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				defer rows.Close()
 				for rows.Next() {
 					t.Errorf("unexpected row: SQL x = NULL never passes")
 				}
@@ -158,6 +162,7 @@ func TestPgserverFullStackE2E(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				defer rows.Close()
 				var ids []int64
 				for rows.Next() {
 					var id int64
@@ -201,6 +206,7 @@ func TestPgserverFullStackE2E(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
 		var count int
 		for rows.Next() {
 			var id int64
