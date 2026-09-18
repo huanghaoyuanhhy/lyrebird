@@ -33,18 +33,17 @@
 //     PG's ROW/ROWS noise words. LIMIT is required: an uncapped SELECT
 //     would stream the whole collection through the store's client-side
 //     sort path
+//   - pgvector distance ordering: ORDER BY vec <->|<=>|<#> '[0.1, …]'
+//     lowers to the plan's vector search (see distanceMetrics) and must
+//     stand alone — it is the whole sort, the ANN top-k. DESC (farthest-
+//     first) has no vector-index answer and is rejected; a distance
+//     predicate in WHERE filters nothing lyrebird can compute and is
+//     rejected with that explanation
 //
 // Fail-fast class: valid SQL beyond the subset returns 0A000
 // (feature_not_supported) naming the member — GROUP BY, aggregates, LIKE,
-// casts, query parameters. The pgvector distance operators (<-> <=> <#>
-// <+>) parse cleanly and are rejected as the not-yet-wired vector path;
-// the operator→metric mapping that path will implement:
-//
-//	<->  L2 distance     → L2      (distances carry over unchanged)
-//	<=>  cosine distance → COSINE  (pgvector returns distance 0..2, Milvus
-//	                       similarity 1..-1 — the shell converts)
-//	<#>  negated dot      → IP      (pgvector emits -(dot); negate on output)
-//	<+>  L1 distance     → no Milvus metric; stays rejected
+// casts, query parameters, WHERE-distance predicates. The L1 operator <+>
+// has no Milvus metric and stays rejected in every position.
 //
 // Mapping notes (see docs/design.md):
 //

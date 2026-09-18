@@ -65,13 +65,16 @@ func describe(t token) string {
 	return "[" + t.text + "]"
 }
 
-// vectorOps are the pgvector distance operators. The grammar accepts them
-// so rejections name the capability rather than the syntax; the
-// operator→metric mapping they will use lives in the package documentation.
+// vectorOps are the pgvector distance operators. `<+>` is recognized so its
+// rejection names the operator rather than the syntax; it has no Milvus
+// metric, so it stays unsupported in every position. The other three order
+// vector searches (parseOrderItem) and are rejected in WHERE, where a
+// distance predicate filters nothing lyrebird can compute (see
+// unsupportedDistance).
 var vectorOps = map[string]bool{"<->": true, "<=>": true, "<#>": true, "<+>": true}
 
 func unsupportedDistance(op string) error {
-	return unsupportedErrf("distance operator [%s] is the vector search path, not wired yet: scalar reads only for now", op)
+	return unsupportedErrf("distance operator [%s] does not filter in WHERE: order the search by it instead — ORDER BY emb %s '[0.1, …]' LIMIT n (scalar filters stay in WHERE)", op, op)
 }
 
 // compareOps are the SQL comparison operators the predicate grammar reads;
@@ -122,11 +125,9 @@ func (p *parser) parseSelect() (*Select, error) {
 		if err := p.expectKeyword("BY"); err != nil {
 			return nil, err
 		}
-		items, err := p.parseOrderBy()
-		if err != nil {
+		if err := p.parseOrderBy(sel); err != nil {
 			return nil, err
 		}
-		sel.order = items
 	}
 	// PG allows LIMIT and OFFSET in either order; each at most once.
 	limitSeen, offsetSeen := false, false
@@ -211,6 +212,9 @@ func (p *parser) parseSelectItem() (string, error) {
 		}
 		if p.peekKeyword("AS") || p.peek().kind == tkIdent {
 			return "", unsupportedErrf("SELECT aliases are not supported: rename on the client side")
+		}
+		if p.peek().kind == tkOp && vectorOps[p.peek().text] {
+			return "", unsupportedErrf("distance expressions in the SELECT list are not supported: order by the distance (ORDER BY %s %s '[0.1, …]') and project plain columns", name, p.peek().text)
 		}
 		if p.peek().kind == tkOp && !p.peekOp(",") {
 			return "", unsupportedErrf("expressions in the SELECT list ([%s] …) are not supported: project plain columns", name)
@@ -309,36 +313,48 @@ func (p *parser) rejectCast() error {
 	return nil
 }
 
-// parseOrderBy reads comma-separated ORDER BY terms.
-func (p *parser) parseOrderBy() ([]orderItem, error) {
-	var items []orderItem
+// parseOrderBy reads comma-separated ORDER BY terms. A distance term
+// (ORDER BY emb <=> '[…]') is the ANN top-k and must stand alone: it is the
+// whole sort, so a second ordering term is rejected by name.
+func (p *parser) parseOrderBy(sel *Select) error {
 	for {
-		item, err := p.parseOrderItem()
+		item, dist, err := p.parseOrderItem()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		items = append(items, item)
+		if dist != nil {
+			if sel.distance != nil || len(sel.order) > 0 || p.peekOp(",") {
+				return unsupportedErrf("a distance ORDER BY is the whole sort (the ANN top-k): no second ordering term")
+			}
+			sel.distance = dist
+			return nil
+		}
+		if sel.distance != nil {
+			return unsupportedErrf("a distance ORDER BY is the whole sort (the ANN top-k): no second ordering term")
+		}
+		sel.order = append(sel.order, item)
 		if !p.peekOp(",") {
-			return items, nil
+			return nil
 		}
 		p.advance()
 	}
 }
 
-func (p *parser) parseOrderItem() (orderItem, error) {
+func (p *parser) parseOrderItem() (orderItem, *orderDistance, error) {
 	col, err := p.parseColumnRef()
 	if err != nil {
-		return orderItem{}, err
+		return orderItem{}, nil, err
 	}
 	if p.peekOp("(") {
-		return orderItem{}, unsupportedErrf("ORDER BY functions and expressions are not supported: order by a column")
+		return orderItem{}, nil, unsupportedErrf("ORDER BY functions and expressions are not supported: order by a column")
 	}
 	if err := p.rejectCast(); err != nil {
-		return orderItem{}, err
+		return orderItem{}, nil, err
 	}
 	if p.peek().kind == tkOp && vectorOps[p.peek().text] {
 		op := p.advance().text
-		return orderItem{}, unsupportedDistance(op)
+		dist, err := p.parseDistanceTail(col, op)
+		return orderItem{}, dist, err
 	}
 	item := orderItem{column: col}
 	switch {
@@ -348,7 +364,26 @@ func (p *parser) parseOrderItem() (orderItem, error) {
 		p.advance()
 		item.desc = true
 	}
-	return item, nil
+	return item, nil, nil
+}
+
+// parseDistanceTail reads the vector literal after `col op` and the sort
+// direction. DESC means farthest-first, which no vector index answers —
+// rejecting it beats silently computing exact distances over every entity.
+func (p *parser) parseDistanceTail(col, op string) (*orderDistance, error) {
+	t := p.peek()
+	if t.kind != tkString {
+		return nil, parseErrf("distance operator [%s] takes a vector literal in single quotes, got %s", op, describe(t))
+	}
+	p.advance()
+	d := &orderDistance{column: col, op: op, vector: t.text}
+	switch {
+	case p.peekKeyword("ASC"):
+		p.advance()
+	case p.peekKeyword("DESC"):
+		return nil, unsupportedErrf("DESC on a distance ordering means farthest-first, which no vector index answers: ANN search returns nearest-first")
+	}
+	return d, nil
 }
 
 // parseIntCount reads the (possibly signed) integer a LIMIT/OFFSET clause
@@ -727,6 +762,13 @@ func resolveQualifiers(sel *Select) error {
 			return err
 		}
 		sel.order[i].column = col
+	}
+	if sel.distance != nil {
+		col, err := strip(sel.distance.column)
+		if err != nil {
+			return err
+		}
+		sel.distance.column = col
 	}
 	return nil
 }

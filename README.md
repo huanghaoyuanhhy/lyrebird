@@ -78,6 +78,9 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
   - [x] wiring: PG wire protocol server (`internal/pgserver`, on
     jeroenrinzema/psql-wire) executes plans through `internal/store`;
     translate errors render as native SQLSTATEs, LIMIT stays mandatory
+  - [x] pgvector distance search: `ORDER BY emb <=> '[0.1, …]' LIMIT n` runs
+    the Milvus ANN path (`<->` L2, `<=>` cosine, `<#>` inner product; the
+    metric must agree with the field's index), scalar WHERE filters ride along
 - [ ] **Phase 3** Schema catalog: config-driven mapping + describe-based discovery;
   DDL (CREATE TABLE → CreateCollection)
 - [ ] **Phase 4** Write path: insert/update/delete → upsert/delete

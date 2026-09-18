@@ -83,6 +83,7 @@ func (e *LogExecutor) Search(ctx context.Context, collection string, plan *trans
 		zap.Int("limit", plan.Limit),
 		zap.Any("sort", plan.Sort),
 		zap.Any("source", plan.Source),
+		zap.Any("search", plan.Search),
 		zap.Bool("no_match", plan.NoMatch),
 	)
 

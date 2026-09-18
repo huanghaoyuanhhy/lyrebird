@@ -191,7 +191,9 @@ func TestTranslateFieldType(t *testing.T) {
 		{entity.NewField().WithName("f").WithDataType(entity.FieldTypeFloat), translate.TypeNumber},
 		{entity.NewField().WithName("b").WithDataType(entity.FieldTypeBool), translate.TypeBool},
 		{entity.NewField().WithName("j").WithDataType(entity.FieldTypeJSON), translate.TypeUnknown},
-		{entity.NewField().WithName("v").WithDataType(entity.FieldTypeFloatVector).WithDim(4), translate.TypeUnknown},
+		{entity.NewField().WithName("v").WithDataType(entity.FieldTypeFloatVector).WithDim(4), translate.TypeVector},
+		{entity.NewField().WithName("bv").WithDataType(entity.FieldTypeBinaryVector).WithDim(8), translate.TypeUnknown},
+		{entity.NewField().WithName("sv").WithDataType(entity.FieldTypeSparseVector), translate.TypeUnknown},
 	}
 	for _, tc := range cases {
 		if got := translateFieldType(tc.field); got != tc.want {

@@ -139,6 +139,64 @@ re-confirmed by the e2e suite now running on `client/v2` v2.6.5:
   translators must default it to true (parseSource does). Documented on the
   Plan to keep the pg translator honest.
 
+## Settled — pg wire entry point (2026-09-16)
+
+Facts locked in while wiring `internal/pgserver` (psql + pgx verified against
+the UAT cluster):
+
+- **RowDescription precedes the rows**, so `SELECT *` cannot wait for the
+  store: `Executor.Schema` feeds `Select.Columns` before execution
+  (store-side: the described schema keeps storage order via `Fields()`).
+- All numeric fields render as **float8** on the wire — the one numeric OID
+  that covers Int and Float storage alike; cells narrow to float64.
+- **translate.Error.Type carries the SQLSTATE verbatim**; the wire shell maps
+  classified failures with no table beyond `wireError`. Missing collection →
+  native 42P01. Server-side execution errors (e.g. metric mismatch) stay
+  XX000 (internal) — classifying Milvus message text is a later concern.
+- **`standard_conforming_strings=on` must be broadcast** in ParameterStatus:
+  pgx refuses simple-protocol queries without it. psql-wire sends no
+  parameters by default; lyrebird seeds server_version/encoding/DateStyle
+  too.
+- **pgx shares one connection across queries: every `Rows` must be Closed**
+  before the next statement, else the conn stays busy (e2e does this).
+- Identifiers keep their written case (no lower folding — ES-created
+  mixed-case fields must stay reachable); quote to escape keywords.
+- Dates stay epoch millis on both fronts; PG-native micros is a Phase 3
+  catalog decision.
+- LIMIT is mandatory on every SELECT: the alternative is streaming the
+  whole collection through the client-side sort path.
+
+## Settled — pg vector search: the pgvector distance path (2026-09-18)
+
+`Plan.Search *SearchSpec` (field + `[]float32` + metric) is the vector
+carrier; store routes non-nil plans through Milvus `search()` instead of
+`query()`.
+
+- **Form**: only `ORDER BY vec <op> '[0.1, …]' LIMIT n` — the canonical
+  pgvector query. The distance term must stand alone (it IS the sort), ASC
+  only (DESC = farthest-first has no ANN answer). Scalar WHERE rides along
+  as the search filter; OFFSET maps to the search offset.
+- **Operator → metric** (the pgvector compat surface):
+  `<->`→L2, `<=>`→COSINE, `<#>`→IP (the negation is a sort-direction trick;
+  nearest-first is the contract either way), `<+>` rejected (no L1 metric).
+- **Metric validation rides the search**: the plan's metric goes to the
+  server via the `metric_type` search param; Milvus rejects a mismatch with
+  the field's index ("metric type not match: expected=L2 actual=COSINE",
+  verified on UAT 2026-09-18). pgvector operators have fixed semantics — a
+  cosine question must never come back answered by L2 distances, so silent
+  index-default behavior is off the table. Known rough edge: that server
+  rejection surfaces as SQLSTATE XX000, not 22023.
+- **Scores don't cross the store boundary yet**: pgvector only surfaces
+  distances when projected, which the SELECT subset rejects anyway; ES
+  `_score` parity is Phase 5. `SearchResult.Total` on this path is the
+  returned row count — count(*) over the filter answers a different
+  question.
+- Dimension validation is the server's (it names the expected dim);
+  `TypeVector` covers the float vector family, binary/sparse stay unknown.
+- Fixtures: `lyrebird_e2e_store` emb is L2 (nearest-first + mismatch
+  coverage); `lyrebird_e2e_vec` is COSINE with strictly-decreasing
+  similarity so order asserts are tie-free.
+
 ## Settled — IR placement: query-level IR stays frontend-private (2026-09-13)
 
 - Layering, top to bottom: **query-level IR is per-frontend** (es: the hand-rolled

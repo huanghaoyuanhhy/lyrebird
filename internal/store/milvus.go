@@ -93,6 +93,9 @@ func (s collectionSchema) Fields() []string {
 // Search implements Executor. Execution shape per plan:
 //
 //   - NoMatch: guaranteed empty, nothing is sent to Milvus.
+//   - Plan.Search != nil: the ANN path — one Milvus search() with the query
+//     vector, the filter riding along, limit+offset as topk window. Rows
+//     come back nearest-first, the ordering every distance operator promises.
 //   - Limit == 0 (ES size:0): count only — Milvus rejects limit 0.
 //   - No sort: one query with offset+limit; the underfilled-window check
 //     (fewer rows than the limit came back) makes the total exact without
@@ -105,6 +108,9 @@ func (s collectionSchema) Fields() []string {
 func (e *MilvusExecutor) Search(ctx context.Context, collection string, plan *translate.Plan) (*SearchResult, error) {
 	if plan.NoMatch {
 		return &SearchResult{}, nil
+	}
+	if plan.Search != nil {
+		return e.vectorSearch(ctx, collection, plan)
 	}
 
 	coll, err := e.describe(ctx, collection)
@@ -172,6 +178,73 @@ func (e *MilvusExecutor) Search(ctx context.Context, collection string, plan *tr
 // row is one fetched entity keyed by field name. A field absent from the map
 // (not fetched, or null) reads as a missing value.
 type row map[string]any
+
+// vectorSearch executes the ANN path: one Milvus search() carrying the
+// query vector, the scalar filter (if any) and the limit+offset window.
+// Total is the returned row count — the only honest number a top-k search
+// has; count(*) over the filter would answer a different question.
+func (e *MilvusExecutor) vectorSearch(ctx context.Context, collection string, plan *translate.Plan) (*SearchResult, error) {
+	if len(plan.Sort) > 0 {
+		return nil, fmt.Errorf("vector search on %q cannot combine a distance ordering with scalar sort terms", collection)
+	}
+	if plan.Limit == 0 {
+		return &SearchResult{}, nil // LIMIT 0: an empty top-k, nothing to send
+	}
+
+	coll, err := e.describe(ctx, collection)
+	if err != nil {
+		return nil, err
+	}
+	fields := coll.Schema.Fields
+	pk := primaryKey(fields)
+	if pk == nil {
+		return nil, fmt.Errorf("collection %q has no primary key field", collection)
+	}
+	proj, err := buildProjection(fields, functionOutputFields(coll.Schema), plan.Source, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// nil Expr renders as "" — Milvus reads an empty expression as unfiltered.
+	expr, err := translate.Render(plan.Expr)
+	if err != nil {
+		return nil, fmt.Errorf("render filter for collection %q: %w", collection, err)
+	}
+
+	spec := plan.Search
+	opt := milvusclient.NewSearchOption(collection, plan.Limit, []entity.Vector{entity.FloatVector(spec.Vector)}).
+		WithANNSField(spec.Field).
+		WithFilter(expr).
+		WithOutputFields(proj.fetch...).
+		WithOffset(plan.Offset)
+	if spec.Metric != "" {
+		// The operator's metric is the one semantic statement pgvector makes
+		// that the index cannot supply: `<=>` means cosine, not whatever the
+		// collection was indexed with. The server rejects a metric that
+		// disagrees with the field's index, so a cosine question never comes
+		// back answered by L2 distances.
+		opt.WithSearchParam("metric_type", string(spec.Metric))
+	}
+
+	rss, err := e.searchOpt(ctx, collection, opt)
+	if err != nil {
+		return nil, err
+	}
+	if len(rss) == 0 {
+		return &SearchResult{}, nil
+	}
+
+	rows := searchRows(rss[0], proj.fetch, pk.Name)
+	hits := make([]Hit, len(rows))
+	for i, r := range rows {
+		id, err := hitID(r, pk)
+		if err != nil {
+			return nil, err
+		}
+		hits[i] = Hit{ID: id, Source: r.project(proj.source)}
+	}
+	return &SearchResult{Total: int64(len(hits)), Hits: hits}, nil
+}
 
 // project keeps only the wanted field names, in schema order.
 // A nil/empty list yields an empty (non-nil) source, matching ES _source: {}
@@ -317,6 +390,27 @@ func (e *MilvusExecutor) queryOpt(ctx context.Context, collection string, opt mi
 	return rs, nil
 }
 
+// searchOpt runs one search call, retrying once behind an auto-load — the
+// search twin of queryOpt: Milvus refuses searches against unloaded
+// collections, ES clients expect every index searchable.
+func (e *MilvusExecutor) searchOpt(ctx context.Context, collection string, opt milvusclient.SearchOption) ([]milvusclient.ResultSet, error) {
+	rss, err := e.cli.Search(ctx, opt)
+	if err == nil {
+		return rss, nil
+	}
+	if !strings.Contains(err.Error(), "not loaded") {
+		return nil, fmt.Errorf("search collection %q: %w", collection, err)
+	}
+	if err := e.loadAndWait(ctx, collection); err != nil {
+		return nil, fmt.Errorf("auto-load collection %q: %w", collection, err)
+	}
+	rss, err = e.cli.Search(ctx, opt)
+	if err != nil {
+		return nil, fmt.Errorf("search collection %q after auto-load: %w", collection, err)
+	}
+	return rss, nil
+}
+
 // loadAndWait loads a collection and blocks until it is queryable.
 func (e *MilvusExecutor) loadAndWait(ctx context.Context, collection string) error {
 	task, err := e.cli.LoadCollection(ctx, milvusclient.NewLoadCollectionOption(collection))
@@ -358,9 +452,12 @@ func translateFieldType(f *entity.Field) translate.FieldType {
 		return translate.TypeNumber
 	case entity.FieldTypeBool:
 		return translate.TypeBool
+	case entity.FieldTypeFloatVector, entity.FieldTypeFloat16Vector, entity.FieldTypeBFloat16Vector:
+		return translate.TypeVector // the fields pgvector distance operators target
 	default:
-		// JSON, Array, vectors: no scalar vocabulary fits; translators treat
-		// unknown fields permissively and Milvus rejects nonsense filters.
+		// JSON, Array, binary/sparse vectors: no scalar vocabulary fits;
+		// translators treat unknown fields permissively and Milvus rejects
+		// nonsense filters.
 		return translate.TypeUnknown
 	}
 }
@@ -534,6 +631,26 @@ func rowsOf(rs milvusclient.ResultSet, outputFields []string) []row {
 			r[name] = v
 		}
 		rows[i] = r
+	}
+	return rows
+}
+
+// searchRows flattens a search ResultSet into row maps. Output fields come
+// from rs.Fields; the primary key rides rs.IDs (Milvus returns it separately
+// from the output projection) and fills the gap where the projection skipped
+// it.
+func searchRows(rs milvusclient.ResultSet, outputFields []string, pkField string) []row {
+	rows := rowsOf(rs, outputFields)
+	if rs.IDs == nil {
+		return rows
+	}
+	for i, r := range rows {
+		if _, ok := r[pkField]; ok {
+			continue
+		}
+		if v, err := rs.IDs.Get(i); err == nil {
+			r[pkField] = v
+		}
 	}
 	return rows
 }

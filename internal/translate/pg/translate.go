@@ -56,6 +56,12 @@ type Select struct {
 	limit  int
 	offset int
 
+	// distance is the pgvector ORDER BY term (`emb <=> '[0.1, …]'`), nil
+	// when ordering by plain columns. It is statement-wide, not an item of
+	// order: a distance ordering is the whole sort (the ANN top-k), so a
+	// second ordering term is rejected at parse time.
+	distance *orderDistance
+
 	// hasLimit distinguishes LIMIT 0 (a valid, count-only plan) from a
 	// statement with no LIMIT clause at all.
 	hasLimit bool
@@ -65,6 +71,16 @@ type Select struct {
 type orderItem struct {
 	column string
 	desc   bool
+}
+
+// orderDistance is the parsed pgvector distance ordering: the vector field,
+// the operator as written, and the vector literal's text (the part between
+// the quotes). Fields resolve and the literal parses into numbers at
+// lowering time, where the schema is known.
+type orderDistance struct {
+	column string
+	op     string
+	vector string
 }
 
 // Parse compiles one SQL statement (the SELECT subset described in the
@@ -175,6 +191,13 @@ func (s *Select) Plan(schema translate.Schema) (*translate.Plan, error) {
 	}
 	for _, o := range s.order {
 		plan.Sort = append(plan.Sort, translate.SortClause{Field: o.column, Desc: o.desc})
+	}
+	if s.distance != nil {
+		spec, err := searchSpec(s.distance, schema)
+		if err != nil {
+			return nil, err
+		}
+		plan.Search = spec
 	}
 
 	w := fold(s.where)

@@ -17,6 +17,12 @@ var testSchema = translate.MapSchema{
 	"created": translate.TypeDate,
 }
 
+// vectorSchema is a collection with one float-vector field, enough to lower
+// the pgvector distance operators.
+var vectorSchema = translate.MapSchema{
+	"embedding": translate.TypeVector,
+}
+
 // limitPlan is the plan of a bare SELECT * with the given LIMIT: match-all,
 // every field, no sort.
 func limitPlan(limit int) *translate.Plan {
@@ -428,8 +434,17 @@ func TestParseAndPlanErrors(t *testing.T) {
 		{name: "two constant comparison", sql: `SELECT * FROM items WHERE 1 = 1 LIMIT 1`, wantType: "0A000", wantReason: "constants"},
 		{name: "column-to-column comparison", sql: `SELECT * FROM items WHERE a = b LIMIT 1`, wantType: "0A000", wantReason: "column-to-column"},
 		{name: "unknown table qualifier", sql: `SELECT * FROM items x WHERE other.status = 'a' LIMIT 1`, wantType: "0A000", wantReason: "another table"},
-		{name: "distance ordering is the vector path", sql: `SELECT * FROM items ORDER BY embedding <=> '[0.1, 0.2]' LIMIT 5`, wantType: "0A000", wantReason: "vector search path"},
-		{name: "distance predicate is the vector path", sql: `SELECT * FROM items WHERE embedding <=> '[0.1]' < 0.5 LIMIT 5`, wantType: "0A000", wantReason: "vector search path"},
+		{name: "distance predicate filters nothing", sql: `SELECT * FROM items WHERE embedding <=> '[0.1]' < 0.5 LIMIT 5`, wantType: "0A000", wantReason: "does not filter in WHERE"},
+		{name: "l1 distance has no milvus metric", sql: `SELECT * FROM items ORDER BY embedding <+> '[0.1, 0.2]' LIMIT 5`, schema: vectorSchema, wantType: "0A000", wantReason: "no Milvus metric"},
+		{name: "distance ordering desc has no ann answer", sql: `SELECT * FROM items ORDER BY embedding <-> '[0.1, 0.2]' DESC LIMIT 5`, schema: vectorSchema, wantType: "0A000", wantReason: "farthest-first"},
+		{name: "distance ordering takes a literal", sql: `SELECT * FROM items ORDER BY embedding <-> other LIMIT 5`, schema: vectorSchema, wantType: "42601", wantReason: "vector literal"},
+		{name: "distance ordering is the whole sort", sql: `SELECT * FROM items ORDER BY embedding <-> '[0.1, 0.2]', id LIMIT 5`, schema: vectorSchema, wantType: "0A000", wantReason: "whole sort"},
+		{name: "second term before distance ordering", sql: `SELECT * FROM items ORDER BY id, embedding <-> '[0.1, 0.2]' LIMIT 5`, schema: vectorSchema, wantType: "0A000", wantReason: "whole sort"},
+		{name: "distance select-list expression", sql: `SELECT embedding <=> '[0.1, 0.2]' FROM items LIMIT 5`, schema: vectorSchema, wantType: "0A000", wantReason: "distance expressions"},
+		{name: "distance on non-vector field", sql: `SELECT * FROM items ORDER BY views <-> '[0.1, 0.2]' LIMIT 5`, schema: testSchema, wantType: "22023", wantReason: "distance operators order on vector fields"},
+		{name: "distance on unknown field", sql: `SELECT * FROM items ORDER BY nosuch <-> '[0.1, 0.2]' LIMIT 5`, schema: testSchema, wantType: "22023", wantReason: "not a vector field"},
+		{name: "unparsable vector literal", sql: `SELECT * FROM items ORDER BY embedding <-> '[0.1, oops]' LIMIT 5`, schema: vectorSchema, wantType: "22023", wantReason: "does not parse"},
+		{name: "empty vector literal", sql: `SELECT * FROM items ORDER BY embedding <-> '' LIMIT 5`, schema: vectorSchema, wantType: "22023", wantReason: "empty"},
 		{name: "limit all", sql: `SELECT * FROM items LIMIT ALL`, wantType: "0A000", wantReason: "row cap"},
 		{name: "missing limit", sql: `SELECT * FROM items`, wantType: "0A000", wantReason: "row cap"},
 	}
@@ -472,5 +487,119 @@ func TestSelectCarriesCollection(t *testing.T) {
 	}
 	if sel.Table != "mixed-Case" {
 		t.Fatalf("Select.Table = %q, want %q", sel.Table, "mixed-Case")
+	}
+}
+
+func TestVectorOrdering(t *testing.T) {
+	tests := []struct {
+		name      string
+		sql       string
+		wantTable string
+		want      *translate.Plan
+		expr      string
+	}{
+		{
+			name:      "cosine ordering, the canonical pgvector query",
+			sql:       `SELECT * FROM items ORDER BY embedding <=> '[0.1, 0.2, 0.3, 0.4]' LIMIT 5`,
+			wantTable: "items",
+			want: &translate.Plan{
+				Limit:  5,
+				Source: translate.SourceFilter{FetchSource: true},
+				Search: &translate.SearchSpec{
+					Field:  "embedding",
+					Vector: []float32{0.1, 0.2, 0.3, 0.4},
+					Metric: translate.MetricCosine,
+				},
+			},
+		},
+		{
+			name:      "l2 and inner product operators map their metrics",
+			sql:       `SELECT id FROM items ORDER BY embedding <-> '[1, 2]' LIMIT 3 OFFSET 2`,
+			wantTable: "items",
+			want: &translate.Plan{
+				Offset: 2,
+				Limit:  3,
+				Source: translate.SourceFilter{FetchSource: true, Includes: []string{"id"}},
+				Search: &translate.SearchSpec{
+					Field:  "embedding",
+					Vector: []float32{1, 2},
+					Metric: translate.MetricL2,
+				},
+			},
+		},
+		{
+			name:      "negated inner product drops its sign in the plan",
+			sql:       `SELECT * FROM items ORDER BY embedding <#> '[0.5]' LIMIT 1`,
+			wantTable: "items",
+			want: &translate.Plan{
+				Limit:  1,
+				Source: translate.SourceFilter{FetchSource: true},
+				Search: &translate.SearchSpec{
+					Field:  "embedding",
+					Vector: []float32{0.5},
+					Metric: translate.MetricIP,
+				},
+			},
+		},
+		{
+			name:      "asc is accepted beside the distance",
+			sql:       `SELECT * FROM items ORDER BY embedding <=> '[1]' ASC LIMIT 2`,
+			wantTable: "items",
+			want: &translate.Plan{
+				Limit:  2,
+				Source: translate.SourceFilter{FetchSource: true},
+				Search: &translate.SearchSpec{Field: "embedding", Vector: []float32{1}, Metric: translate.MetricCosine},
+			},
+		},
+		{
+			name:      "scalar filter rides the vector search",
+			sql:       `SELECT name FROM items WHERE active = true ORDER BY embedding <-> '[0, 0]' LIMIT 10`,
+			wantTable: "items",
+			expr:      `active == true`,
+			want: &translate.Plan{
+				Limit:  10,
+				Source: translate.SourceFilter{FetchSource: true, Includes: []string{"name"}},
+				Search: &translate.SearchSpec{Field: "embedding", Vector: []float32{0, 0}, Metric: translate.MetricL2},
+			},
+		},
+		{
+			name:      "brackets are optional in the vector literal",
+			sql:       `SELECT * FROM items ORDER BY embedding <=> '1, 2, 3' LIMIT 5`,
+			wantTable: "items",
+			want: &translate.Plan{
+				Limit:  5,
+				Source: translate.SourceFilter{FetchSource: true},
+				Search: &translate.SearchSpec{Field: "embedding", Vector: []float32{1, 2, 3}, Metric: translate.MetricCosine},
+			},
+		},
+		{
+			name:      "qualifiers strip on the distance field",
+			sql:       `SELECT * FROM items i ORDER BY i.embedding <=> '[1]' LIMIT 1`,
+			wantTable: "items",
+			want: &translate.Plan{
+				Limit:  1,
+				Source: translate.SourceFilter{FetchSource: true},
+				Search: &translate.SearchSpec{Field: "embedding", Vector: []float32{1}, Metric: translate.MetricCosine},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sel, got := planOf(t, tt.sql, vectorSchema)
+			if sel.Table != tt.wantTable {
+				t.Fatalf("Select.Table = %q, want %q", sel.Table, tt.wantTable)
+			}
+			rendered, err := translate.Render(got.Expr)
+			if err != nil {
+				t.Fatalf("Render(got.Expr) error = %v", err)
+			}
+			if rendered != tt.expr {
+				t.Fatalf("Render(plan.Expr) = %q, want %q", rendered, tt.expr)
+			}
+			got.Expr = nil // compared via rendering above
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Plan() =\n  got  %+v\n  want %+v", got, tt.want)
+			}
+		})
 	}
 }

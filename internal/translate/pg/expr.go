@@ -3,6 +3,7 @@ package pg
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
@@ -166,6 +167,62 @@ var compareMilvusOps = map[string]translate.CompareOp{
 	"<=": translate.Le,
 	">":  translate.Gt,
 	">=": translate.Ge,
+}
+
+// distanceMetrics maps the pgvector distance operators onto Milvus metrics —
+// the pgvector compatibility surface is exactly this table (docs/design.md).
+// <+> is absent on purpose: L1 distance has no Milvus metric.
+var distanceMetrics = map[string]translate.Metric{
+	"<->": translate.MetricL2,
+	"<=>": translate.MetricCosine,
+	"<#>": translate.MetricIP,
+}
+
+// searchSpec lowers one ORDER BY distance term into the plan's vector
+// search: the operator picks the metric, the literal becomes the query
+// vector, and the field must be a vector field of this collection. `<#>`
+// (negated inner product) orders identically to IP — pgvector's negation is
+// an ascending-sort trick, and nearest-first is the ANN contract either way,
+// so the sign flip never reaches the plan.
+func searchSpec(d *orderDistance, schema translate.Schema) (*translate.SearchSpec, error) {
+	metric, ok := distanceMetrics[d.op]
+	if !ok {
+		return nil, unsupportedErrf("distance operator [%s] has no Milvus metric: use <-> (L2), <=> (cosine) or <#> (inner product)", d.op)
+	}
+	if ft := schema.FieldType(d.column); ft != translate.TypeVector {
+		if ft == translate.TypeUnknown {
+			return nil, illegalErrf("field [%s] is not a vector field of this collection", d.column)
+		}
+		return nil, illegalErrf("field [%s] is a %s field: distance operators order on vector fields", d.column, ft)
+	}
+	vec, err := parseVector(d.vector)
+	if err != nil {
+		return nil, err
+	}
+	return &translate.SearchSpec{Field: d.column, Vector: vec, Metric: metric}, nil
+}
+
+// parseVector reads a pgvector literal body — the text between the SQL
+// quotes — into float32s. pgvector's text form wraps the numbers in square
+// brackets; the brackets are accepted missing. The vector's dimension is the
+// server's call: Milvus rejects a mismatching length by name.
+func parseVector(s string) ([]float32, error) {
+	body := strings.TrimSpace(s)
+	body = strings.TrimSuffix(strings.TrimPrefix(body, "["), "]")
+	if strings.TrimSpace(body) == "" {
+		return nil, illegalErrf("vector literal is empty: write the query vector as comma-separated numbers in brackets, e.g. '[0.1, 0.2, 0.3]'")
+	}
+	parts := strings.Split(body, ",")
+	vec := make([]float32, 0, len(parts))
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		f, err := strconv.ParseFloat(p, 32)
+		if err != nil {
+			return nil, illegalErrf("vector literal is %d comma-separated numbers, e.g. '[0.1, 0.2, 0.3]': entry %d ([%s]) does not parse as a number", len(parts), i+1, p)
+		}
+		vec = append(vec, float32(f))
+	}
+	return vec, nil
 }
 
 // buildWhere lowers the folded WHERE tree into the Milvus expression AST.

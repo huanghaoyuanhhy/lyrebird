@@ -37,6 +37,36 @@ type Plan struct {
 	// minimum_should_match above the surviving should-clause count, or an
 	// empty terms list). The store returns an empty result without executing.
 	NoMatch bool
+
+	// Search carries the vector side of a read: the ANN field, the query
+	// vector, and the distance metric. nil is a pure scalar read executed
+	// through Milvus query(); non-nil routes the plan through Milvus search()
+	// with Expr (if any) riding along as the filter. The pg front fills it
+	// from ORDER BY distance operators; the ES front has no producer yet
+	// (knn is rejected there).
+	Search *SearchSpec
+}
+
+// Metric is the distance vocabulary of a vector search. The values match the
+// strings Milvus and Zilliz Cloud spell in index params ("metric_type"), so
+// the store can pass them through without a mapping table.
+type Metric string
+
+const (
+	MetricL2     Metric = "L2"
+	MetricIP     Metric = "IP"
+	MetricCosine Metric = "COSINE"
+)
+
+// SearchSpec is one vector search: field, query vector, metric. Metric is
+// empty when the protocol does not name one (a future ES knn translation
+// reads it from the mapping) — the store then executes with the collection's
+// index metric. A filled Metric is a semantic statement: the store executes
+// with it, and the server rejects it when the index disagrees.
+type SearchSpec struct {
+	Field  string
+	Vector []float32
+	Metric Metric
 }
 
 // SortClause is one ordering term; Field is an external (client-facing) name.
@@ -68,6 +98,10 @@ const (
 	TypeNumber  FieldType = "number"
 	TypeBool    FieldType = "bool"
 	TypeDate    FieldType = "date"
+	// TypeVector marks the float vector family (FloatVector / Float16 /
+	// BFloat16) — the fields distance operators may target. Binary and
+	// sparse vectors stay unknown: no pgvector operator maps to them.
+	TypeVector FieldType = "vector"
 	// TypeUnknown covers fields absent from the catalog.
 	TypeUnknown FieldType = "unknown"
 )

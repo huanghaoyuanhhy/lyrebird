@@ -30,6 +30,12 @@ const Collection = "lyrebird_e2e_store"
 // match → TEXT_MATCH path end to end.
 const TextCollection = "lyrebird_e2e_text"
 
+// VectorCollection is the cosine-indexed vector fixture for the pgvector
+// distance path: five unit-square vectors whose similarity to the query
+// '[1, 0, 0, 0]' decreases strictly with id, so nearest-first order is
+// [1 2 3 4 5] under both cosine and L2 (no ties to smooth over).
+const VectorCollection = "lyrebird_e2e_vec"
+
 // Config is a parsed endpoint.
 type Config struct {
 	URI   string
@@ -69,6 +75,9 @@ func Seed(ctx context.Context, cfg Config) error {
 	}
 	if err := seedText(ctx, cli); err != nil {
 		return fmt.Errorf("text fixture: %w", err)
+	}
+	if err := seedVec(ctx, cli); err != nil {
+		return fmt.Errorf("vector fixture: %w", err)
 	}
 	return nil
 }
@@ -153,6 +162,36 @@ func seedText(ctx context.Context, cli *milvusclient.Client) error {
 		return fmt.Errorf("insert: %w", err)
 	}
 	return finalize(ctx, cli, TextCollection, "sparse", entity.BM25)
+}
+
+// seedVec rebuilds the cosine vector fixture:
+//
+//	id tag   emb
+//	1  odd   [1.0, 0.0, 0.0, 0.0]
+//	2  even  [0.8, 0.2, 0.0, 0.0]
+//	3  odd   [0.6, 0.4, 0.0, 0.0]
+//	4  even  [0.4, 0.6, 0.0, 0.0]
+//	5  odd   [0.2, 0.8, 0.0, 0.0]
+func seedVec(ctx context.Context, cli *milvusclient.Client) error {
+	if err := recreate(ctx, cli, VectorCollection, entity.NewSchema().
+		WithName(VectorCollection).
+		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
+		WithField(entity.NewField().WithName("tag").WithDataType(entity.FieldTypeVarChar).WithMaxLength(16)).
+		WithField(entity.NewField().WithName("emb").WithDataType(entity.FieldTypeFloatVector).WithDim(4))); err != nil {
+		return err
+	}
+
+	_, err := cli.Insert(ctx, milvusclient.NewColumnBasedInsertOption(VectorCollection,
+		column.NewColumnInt64("id", []int64{1, 2, 3, 4, 5}),
+		column.NewColumnVarChar("tag", []string{"odd", "even", "odd", "even", "odd"}),
+		column.NewColumnFloatVector("emb", 4, [][]float32{
+			{1.0, 0.0, 0.0, 0.0}, {0.8, 0.2, 0.0, 0.0}, {0.6, 0.4, 0.0, 0.0},
+			{0.4, 0.6, 0.0, 0.0}, {0.2, 0.8, 0.0, 0.0},
+		})))
+	if err != nil {
+		return fmt.Errorf("insert: %w", err)
+	}
+	return finalize(ctx, cli, VectorCollection, "emb", entity.COSINE)
 }
 
 // mustNullableVarChar adapts the (column, error) nullable constructor to a

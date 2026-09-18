@@ -267,12 +267,88 @@ func TestMilvusExecutorE2E(t *testing.T) {
 			"active":     translate.TypeBool,
 			"created_ms": translate.TypeNumber,
 			"note":       translate.TypeKeyword,
-			"emb":        translate.TypeUnknown,
+			"emb":        translate.TypeVector,
 		}
 		for f, w := range want {
 			if got := schema.FieldType(f); got != w {
 				t.Errorf("field %s = %s, want %s", f, got, w)
 			}
+		}
+	})
+
+	t.Run("vector search returns nearest-first", func(t *testing.T) {
+		plan := &translate.Plan{
+			Limit:  3,
+			Source: fetchSource(),
+			Search: &translate.SearchSpec{
+				Field:  "emb",
+				Vector: []float32{0.1, 0.2, 0.3, 0.4}, // row 1's vector: exact hit
+				Metric: translate.MetricL2,
+			},
+		}
+		res := mustSearch(t, ctx, exec, plan)
+		if res.Total != 3 || len(res.Hits) != 3 {
+			t.Fatalf("total=%d hits=%d, want 3/3 (top-k total is the row count)", res.Total, len(res.Hits))
+		}
+		// L2 to [0.1,0.2,0.3,0.4] grows strictly with id on this fixture.
+		for i, want := range []string{"1", "2", "3"} {
+			if res.Hits[i].ID != want {
+				t.Errorf("hit %d = %s, want %s", i, res.Hits[i].ID, want)
+			}
+		}
+		if res.Hits[0].Source["name"] != "alpha" {
+			t.Errorf("nearest hit source = %v, want the alpha row", res.Hits[0].Source)
+		}
+	})
+
+	t.Run("vector search with scalar filter", func(t *testing.T) {
+		plan := &translate.Plan{
+			Limit: 2,
+			Expr:  translate.Compare{Op: translate.Gt, Field: "price", Value: translate.FloatValue(10)},
+			Search: &translate.SearchSpec{
+				Field:  "emb",
+				Vector: []float32{0.1, 0.2, 0.3, 0.4},
+				Metric: translate.MetricL2,
+			},
+		}
+		res := mustSearch(t, ctx, exec, plan)
+		// price > 10 keeps ids 1, 2, 4, 5; nearest two are 1 then 2.
+		if len(res.Hits) != 2 || res.Hits[0].ID != "1" || res.Hits[1].ID != "2" {
+			t.Fatalf("hits = %v, want [1 2]", hitIDs(res))
+		}
+	})
+
+	t.Run("cosine search on the cosine fixture", func(t *testing.T) {
+		plan := &translate.Plan{
+			Limit:  5,
+			Source: fetchSource(),
+			Search: &translate.SearchSpec{
+				Field:  "emb",
+				Vector: []float32{1, 0, 0, 0},
+				Metric: translate.MetricCosine,
+			},
+		}
+		res, err := exec.Search(ctx, milvustest.VectorCollection, plan)
+		if err != nil {
+			t.Fatalf("cosine search: %v", err)
+		}
+		if len(res.Hits) != 5 {
+			t.Fatalf("hits=%d, want 5", len(res.Hits))
+		}
+		for i, want := range []string{"1", "2", "3", "4", "5"} {
+			if res.Hits[i].ID != want {
+				t.Errorf("hit %d = %s, want %s (cosine order is strict on this fixture)", i, res.Hits[i].ID, want)
+			}
+		}
+	})
+
+	t.Run("metric disagreeing with the index fails", func(t *testing.T) {
+		plan := &translate.Plan{
+			Limit:  1,
+			Search: &translate.SearchSpec{Field: "emb", Vector: []float32{1, 0, 0, 0}, Metric: translate.MetricCosine},
+		}
+		if _, err := exec.Search(ctx, milvustest.Collection, plan); err == nil {
+			t.Error("cosine operator on an L2-indexed field should fail, not silently answer with L2 distances")
 		}
 	})
 
@@ -295,4 +371,12 @@ func mustSearch(t *testing.T, ctx context.Context, exec *MilvusExecutor, plan *t
 		t.Fatalf("search: %v", err)
 	}
 	return res
+}
+
+func hitIDs(res *SearchResult) []string {
+	ids := make([]string, len(res.Hits))
+	for i, h := range res.Hits {
+		ids[i] = h.ID
+	}
+	return ids
 }

@@ -143,6 +143,47 @@ func TestPgserverFullStackE2E(t *testing.T) {
 				}
 			})
 
+			t.Run("vector ordering returns nearest-first", func(t *testing.T) {
+				sql := fmt.Sprintf("SELECT id FROM %s ORDER BY emb <-> '[0.1, 0.2, 0.3, 0.4]' LIMIT 2", table)
+				ids := queryIDs(t, ctx, conn, sql)
+				// the query vector is row 1's; L2 grows strictly with id
+				if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+					t.Errorf("ids = %v, want [1 2]", ids)
+				}
+			})
+
+			t.Run("vector ordering with filter and offset", func(t *testing.T) {
+				sql := fmt.Sprintf("SELECT id FROM %s WHERE price > 10 ORDER BY emb <-> '[0.1, 0.2, 0.3, 0.4]' LIMIT 2 OFFSET 1", table)
+				ids := queryIDs(t, ctx, conn, sql)
+				// price > 10 keeps ids 1,2,4,5 → nearest order [1 2 4 5], window [1,3)
+				if len(ids) != 2 || ids[0] != 2 || ids[1] != 4 {
+					t.Errorf("ids = %v, want [2 4]", ids)
+				}
+			})
+
+			t.Run("vector errors render natively", func(t *testing.T) {
+				// <+> has no Milvus metric: rejected in the translator
+				_, err := conn.Exec(ctx, fmt.Sprintf("SELECT id FROM %s ORDER BY emb <+> '[0.1, 0.2, 0.3, 0.4]' LIMIT 2", table))
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) || pgErr.Code != "0A000" {
+					t.Errorf("<+> operator: err = %v, want SQLSTATE 0A000", err)
+				}
+				// a non-numeric vector literal is a value error
+				_, err = conn.Exec(ctx, fmt.Sprintf("SELECT id FROM %s ORDER BY emb <-> '[0.1, oops]' LIMIT 2", table))
+				if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
+					t.Errorf("bad vector literal: err = %v, want SQLSTATE 22023", err)
+				}
+				// a cosine question against an L2 index must fail loudly at
+				// execution, not silently answer with L2 distances (the
+				// metric travels with the search; the server rejects it)
+				_, err = conn.Exec(ctx, fmt.Sprintf("SELECT id FROM %s ORDER BY emb <=> '[0.1, 0.2, 0.3, 0.4]' LIMIT 2", table))
+				if err == nil {
+					t.Error("cosine operator on an L2-indexed field should fail")
+				} else {
+					t.Logf("metric mismatch surfaced as: %v", err)
+				}
+			})
+
 			t.Run("three valued logic: equals null matches nothing", func(t *testing.T) {
 				rows, err := conn.Query(ctx, fmt.Sprintf("SELECT id FROM %s WHERE price = NULL LIMIT 10", table))
 				if err != nil {
@@ -194,6 +235,31 @@ func TestPgserverFullStackE2E(t *testing.T) {
 		})
 	}
 
+	t.Run("cosine fixture answers the <=> operator", func(t *testing.T) {
+		dsn := fmt.Sprintf("postgres://lyrebird:lyrebird@%s/postgres?sslmode=disable", ln.Addr())
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(context.Background())
+		table := milvustest.VectorCollection
+
+		ids := queryIDs(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s ORDER BY emb <=> '[1, 0, 0, 0]' LIMIT 5", table))
+		if len(ids) != 5 {
+			t.Fatalf("ids = %v, want five rows", ids)
+		}
+		for i, want := range []int64{1, 2, 3, 4, 5} {
+			if ids[i] != want {
+				t.Errorf("row %d = %d, want %d (cosine order is strict on this fixture)", i, ids[i], want)
+			}
+		}
+
+		ids = queryIDs(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s WHERE tag = 'odd' ORDER BY emb <=> '[1, 0, 0, 0]' LIMIT 3", table))
+		if len(ids) != 3 || ids[0] != 1 || ids[1] != 3 || ids[2] != 5 {
+			t.Errorf("filtered ids = %v, want [1 3 5]", ids)
+		}
+	})
+
 	t.Run("bm25 text fixture selects as plain columns", func(t *testing.T) {
 		dsn := fmt.Sprintf("postgres://lyrebird:lyrebird@%s/postgres?sslmode=disable", ln.Addr())
 		conn, err := pgx.Connect(ctx, dsn)
@@ -223,4 +289,26 @@ func TestPgserverFullStackE2E(t *testing.T) {
 			t.Errorf("rows = %d, want 5", count)
 		}
 	})
+}
+
+// queryIDs runs one single-int-column statement and collects the rows.
+func queryIDs(t *testing.T, ctx context.Context, conn *pgx.Conn, sql string) []int64 {
+	t.Helper()
+	rows, err := conn.Query(ctx, sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
