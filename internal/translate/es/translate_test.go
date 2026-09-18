@@ -30,6 +30,15 @@ func baseNoMatch() *translate.Plan {
 	return p
 }
 
+// knnBase is the plan a minimal knn clause produces: ES defaults (limit 10,
+// source on) plus the vector search. The expected filter of a case rides the
+// expr field, same as the query-plan cases.
+func knnBase() *translate.Plan {
+	p := basePlan()
+	p.Search = &translate.SearchSpec{Field: "emb", Vector: []float32{0.1, 0.2, 0.3}}
+	return p
+}
+
 func TestTranslate(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -319,6 +328,53 @@ func TestTranslate(t *testing.T) {
 			body: `{"from": 9000, "size": 1000}`,
 			want: &translate.Plan{Offset: 9000, Limit: 1000, Source: translate.SourceFilter{FetchSource: true}},
 		},
+		{
+			name: "knn minimal clause",
+			body: `{"knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3]}}`,
+			want: knnBase(),
+		},
+		{
+			name: "knn k windows the plan",
+			body: `{"knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3], "k": 3}}`,
+			want: func() *translate.Plan { p := knnBase(); p.Limit = 3; return p }(),
+		},
+		{
+			name: "knn without k defaults to size",
+			body: `{"size": 4, "knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3]}}`,
+			want: func() *translate.Plan { p := knnBase(); p.Limit = 4; return p }(),
+		},
+		{
+			name: "knn from applies",
+			body: `{"from": 2, "knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3]}}`,
+			want: func() *translate.Plan { p := knnBase(); p.Offset = 2; return p }(),
+		},
+		{
+			name: "knn filter narrows the ANN set",
+			body: `{"knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3], "filter": {"term": {"status": "ok"}}}}`,
+			want: knnBase(),
+			expr: `status == "ok"`,
+		},
+		{
+			name: "knn filter array is AND",
+			body: `{"knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3], "filter": [{"term": {"status": "ok"}}, {"range": {"views": {"gte": 1}}}]}}`,
+			want: knnBase(),
+			expr: `(status == "ok") and (views >= 1)`,
+		},
+		{
+			name: "knn num_candidates, boost and _name are ignored",
+			body: `{"knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3], "num_candidates": 100, "boost": 2.0, "_name": "my search"}}`,
+			want: knnBase(),
+		},
+		{
+			name: "knn _source and from ride the normal path",
+			body: `{"from": 1, "knn": {"field": "emb", "query_vector": [0.1, 0.2, 0.3]}, "_source": ["title"]}`,
+			want: func() *translate.Plan {
+				p := knnBase()
+				p.Offset = 1
+				p.Source = translate.SourceFilter{FetchSource: true, Includes: []string{"title"}}
+				return p
+			}(),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -448,8 +504,75 @@ func TestTranslateErrors(t *testing.T) {
 			wantReason: "[aggs]",
 		},
 		{
-			name:     "knn fails fast",
-			body:     `{"knn": {"field": "vec", "query_vector": [0.1]}}`,
+			name:       "knn array form (score fusion) fails fast",
+			body:       `{"knn": [{"field": "v", "query_vector": [0.1]}, {"field": "v", "query_vector": [0.2]}]}`,
+			wantType:   "unsupported_exception",
+			wantReason: "array form",
+		},
+		{
+			name:       "knn with query fails fast",
+			body:       `{"query": {"match_all": {}}, "knn": {"field": "v", "query_vector": [0.1]}}`,
+			wantType:   "unsupported_exception",
+			wantReason: "[query]",
+		},
+		{
+			name:     "knn with sort fails fast",
+			body:     `{"knn": {"field": "v", "query_vector": [0.1]}, "sort": [{"views": "asc"}]}`,
+			wantType: "unsupported_exception",
+		},
+		{
+			name:       "knn similarity threshold fails fast",
+			body:       `{"knn": {"field": "v", "query_vector": [0.1], "similarity": 0.9}}`,
+			wantType:   "unsupported_exception",
+			wantReason: "similarity",
+		},
+		{
+			name:       "knn missing field",
+			body:       `{"knn": {"query_vector": [0.1]}}`,
+			wantType:   "parsing_exception",
+			wantReason: "[field]",
+		},
+		{
+			name:       "knn missing query_vector",
+			body:       `{"knn": {"field": "v"}}`,
+			wantType:   "parsing_exception",
+			wantReason: "[query_vector]",
+		},
+		{
+			name:     "knn query_vector not an array",
+			body:     `{"knn": {"field": "v", "query_vector": 0.1}}`,
+			wantType: "parsing_exception",
+		},
+		{
+			name:       "knn query_vector element not a number",
+			body:       `{"knn": {"field": "v", "query_vector": [0.1, "x"]}}`,
+			wantType:   "illegal_argument_exception",
+			wantReason: "element 1",
+		},
+		{
+			name:     "knn empty query_vector",
+			body:     `{"knn": {"field": "v", "query_vector": []}}`,
+			wantType: "illegal_argument_exception",
+		},
+		{
+			name:     "knn k below one",
+			body:     `{"knn": {"field": "v", "query_vector": [0.1], "k": 0}}`,
+			wantType: "illegal_argument_exception",
+		},
+		{
+			name:     "knn k not a number",
+			body:     `{"knn": {"field": "v", "query_vector": [0.1], "k": "ten"}}`,
+			wantType: "illegal_argument_exception",
+		},
+		{
+			name:       "knn unknown parameter",
+			body:       `{"knn": {"field": "v", "query_vector": [0.1], "fuzziness": 2}}`,
+			wantType:   "parsing_exception",
+			wantReason: "[fuzziness]",
+		},
+		{
+			name:     "knn filter beyond the surface",
+			body:     `{"knn": {"field": "v", "query_vector": [0.1], "filter": {"fuzzy": {"title": "x"}}}}`,
 			wantType: "unsupported_exception",
 		},
 		{

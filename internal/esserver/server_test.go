@@ -224,6 +224,55 @@ func TestSearchExecutorFailureRendersPhaseError(t *testing.T) {
 	}
 }
 
+func TestSearchKnnRidesTheVectorPath(t *testing.T) {
+	exec := &fakeExecutor{
+		result: &store.SearchResult{
+			Total: 2,
+			Hits:  []store.Hit{{ID: "1", Source: map[string]any{"name": "alpha"}}, {ID: "2"}},
+		},
+	}
+	srv := serve(t, exec)
+
+	status, body := searchRequest(t, srv, http.MethodPost, "/products/_search",
+		`{"knn":{"field":"emb","query_vector":[0.1,0.2],"k":2,"num_candidates":100,"filter":{"term":{"status":"ok"}}}}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", status, body)
+	}
+
+	spec := exec.gotPlan.Search
+	if spec == nil {
+		t.Fatal("knn did not reach the executor as plan.Search")
+	}
+	if spec.Field != "emb" {
+		t.Errorf("spec.Field = %q, want emb", spec.Field)
+	}
+	if len(spec.Vector) != 2 || spec.Vector[0] != 0.1 || spec.Vector[1] != 0.2 {
+		t.Errorf("spec.Vector = %v, want [0.1 0.2]", spec.Vector)
+	}
+	if spec.Metric != "" {
+		t.Errorf("spec.Metric = %q, want empty (ES takes the metric from the mapping)", spec.Metric)
+	}
+	if exec.gotPlan.Limit != 2 {
+		t.Errorf("limit = %d, want k=2", exec.gotPlan.Limit)
+	}
+	rendered, err := translate.Render(exec.gotPlan.Expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered != `status == "ok"` {
+		t.Errorf("filter expr = %q, want the knn filter", rendered)
+	}
+
+	hits := body["hits"].(map[string]any)
+	if hits["total"].(map[string]any)["value"] != float64(2) {
+		t.Errorf("total = %v, want the top-k row count", hits["hits"])
+	}
+	first := hits["hits"].([]any)[0].(map[string]any)
+	if first["_score"] != 1.0 {
+		t.Errorf("_score = %v, want the constant 1.0 until Phase 5", first["_score"])
+	}
+}
+
 func TestSearchRoutesAndParams(t *testing.T) {
 	exec := &fakeExecutor{}
 	srv := serve(t, exec)

@@ -42,8 +42,8 @@ type Plan struct {
 	// vector, and the distance metric. nil is a pure scalar read executed
 	// through Milvus query(); non-nil routes the plan through Milvus search()
 	// with Expr (if any) riding along as the filter. The pg front fills it
-	// from ORDER BY distance operators; the ES front has no producer yet
-	// (knn is rejected there).
+	// from ORDER BY distance operators; the ES front from the top-level knn
+	// clause.
 	Search *SearchSpec
 }
 
@@ -59,10 +59,11 @@ const (
 )
 
 // SearchSpec is one vector search: field, query vector, metric. Metric is
-// empty when the protocol does not name one (a future ES knn translation
-// reads it from the mapping) — the store then executes with the collection's
-// index metric. A filled Metric is a semantic statement: the store executes
-// with it, and the server rejects it when the index disagrees.
+// empty when the protocol does not name one (ES knn: the distance comes from
+// the dense_vector mapping, so the store executes with the collection's
+// index metric; pgvector operators always name one). A filled Metric is a
+// semantic statement: the store executes with it, and the server rejects it
+// when the index disagrees.
 type SearchSpec struct {
 	Field  string
 	Vector []float32
@@ -98,9 +99,11 @@ const (
 	TypeNumber  FieldType = "number"
 	TypeBool    FieldType = "bool"
 	TypeDate    FieldType = "date"
-	// TypeVector marks the float vector family (FloatVector / Float16 /
-	// BFloat16) — the fields distance operators may target. Binary and
-	// sparse vectors stay unknown: no pgvector operator maps to them.
+	// TypeVector marks the fp32 FloatVector — the only vector family the
+	// store sends, since query vectors are []float32. The other vector
+	// families (fp16/bf16, binary, sparse) stay TypeUnknown so a search
+	// targeting them fails with a local translation error instead of a
+	// server-side type mismatch.
 	TypeVector FieldType = "vector"
 	// TypeUnknown covers fields absent from the catalog.
 	TypeUnknown FieldType = "unknown"

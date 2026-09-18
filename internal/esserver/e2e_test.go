@@ -142,6 +142,75 @@ func TestEsserverFullStackE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("knn returns nearest-first on the cosine fixture", func(t *testing.T) {
+		res := roundtrip(t, srv, http.MethodPost, milvustest.VectorCollection+"/_search",
+			`{"knn":{"field":"emb","query_vector":[1,0,0,0],"k":5,"num_candidates":100}}`, http.StatusOK)
+		hits := res["hits"].(map[string]any)
+		if hits["total"].(map[string]any)["value"] != float64(5) {
+			t.Errorf("total = %v, want 5 (the top-k row count)", hits["total"])
+		}
+		items := hits["hits"].([]any)
+		if len(items) != 5 {
+			t.Fatalf("hits = %d, want 5", len(items))
+		}
+		for i, want := range []string{"1", "2", "3", "4", "5"} {
+			hit := items[i].(map[string]any)
+			if hit["_id"] != want {
+				t.Errorf("hit %d = %v, want %s (nearest-first)", i, hit["_id"], want)
+			}
+			if hit["_score"] != 1.0 {
+				t.Errorf("hit %d _score = %v, want the constant 1.0 until Phase 5", i, hit["_score"])
+			}
+		}
+	})
+
+	t.Run("knn filter narrows the candidates", func(t *testing.T) {
+		res := roundtrip(t, srv, http.MethodPost, milvustest.VectorCollection+"/_search",
+			`{"knn":{"field":"emb","query_vector":[1,0,0,0],"k":5,"filter":{"term":{"tag":"odd"}}}}`, http.StatusOK)
+		items := res["hits"].(map[string]any)["hits"].([]any)
+		var ids []string
+		for _, item := range items {
+			ids = append(ids, item.(map[string]any)["_id"].(string))
+		}
+		if strings.Join(ids, ",") != "1,3,5" {
+			t.Errorf("hits = %v, want [1 3 5] (odd tags only, nearest-first)", ids)
+		}
+	})
+
+	t.Run("knn rides the L2 fixture with paging", func(t *testing.T) {
+		// k windows the ANN search and from offsets into it; an explicit k
+		// wins over size (size only seeds k's default — the v1 approximation
+		// of ES's from/size-over-top-k windowing, docs/design.md)
+		res := roundtrip(t, srv, http.MethodPost, milvustest.Collection+"/_search",
+			`{"knn":{"field":"emb","query_vector":[0.1,0.2,0.3,0.4],"k":2},"from":1}`, http.StatusOK)
+		items := res["hits"].(map[string]any)["hits"].([]any)
+		if len(items) != 2 {
+			t.Fatalf("hits = %d, want 2", len(items))
+		}
+		// L2 to row 1's vector grows strictly with id: window [1,3) is ids 2,3
+		for i, want := range []string{"2", "3"} {
+			if items[i].(map[string]any)["_id"] != want {
+				t.Errorf("hit %d = %v, want %s", i, items[i].(map[string]any)["_id"], want)
+			}
+		}
+	})
+
+	t.Run("knn errors keep the ES classification", func(t *testing.T) {
+		knnErr := func(body string, wantType string) {
+			t.Helper()
+			res := roundtrip(t, srv, http.MethodPost, milvustest.Collection+"/_search", body, http.StatusBadRequest)
+			if got := res["error"].(map[string]any)["type"]; got != wantType {
+				t.Errorf("error.type = %v, want %s (body: %s)", got, wantType, body)
+			}
+		}
+		knnErr(`{"knn":[{"field":"emb","query_vector":[1,0,0,0]}]}`, "unsupported_exception")                        // array form
+		knnErr(`{"query":{"match_all":{}},"knn":{"field":"emb","query_vector":[1,0,0,0]}}`, "unsupported_exception") // + query
+		knnErr(`{"knn":{"field":"emb","query_vector":[1,0,0,0],"similarity":0.9}}`, "unsupported_exception")         // range search
+		knnErr(`{"knn":{"field":"emb","query_vector":0.5}}`, "parsing_exception")                                    // vector shape
+		knnErr(`{"knn":{"query_vector":[1,0,0,0]}}`, "parsing_exception")                                            // missing field
+		knnErr(`{"knn":{"field":"emb","query_vector":[1,"x"]}}`, "illegal_argument_exception")                       // element value
+	})
+
 	t.Run("missing index renders index_not_found", func(t *testing.T) {
 		res := roundtrip(t, srv, http.MethodPost, "no_such_index/_search", `{}`, http.StatusNotFound)
 		errBody := res["error"].(map[string]any)

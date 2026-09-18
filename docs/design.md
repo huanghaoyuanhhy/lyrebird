@@ -192,10 +192,61 @@ carrier; store routes non-nil plans through Milvus `search()` instead of
   returned row count — count(*) over the filter answers a different
   question.
 - Dimension validation is the server's (it names the expected dim);
-  `TypeVector` covers the float vector family, binary/sparse stay unknown.
+  `TypeVector` covers fp32 FloatVector only since the ES knn work (2026-09-19
+  note below) — fp16/bf16/binary/sparse stay unknown.
 - Fixtures: `lyrebird_e2e_store` emb is L2 (nearest-first + mismatch
   coverage); `lyrebird_e2e_vec` is COSINE with strictly-decreasing
   similarity so order asserts are tie-free.
+
+## Settled — ES knn: the top-level knn clause (2026-09-19)
+
+The ES twin of the pgvector path (2026-09-18 note): the top-level `knn`
+object lowers into the same `Plan.Search *SearchSpec`, and esserver keeps
+emitting the plain search envelope — Plan stays the only contract, the
+envelope assembly is untouched.
+
+- **Form**: object only (one knn clause). The array form (ES 8.9's multiple
+  knn sub-searches fused by score) is `unsupported_exception` — one
+  SearchSpec cannot carry it. `knn` next to `query` is also unsupported
+  (score fusion is Phase 5), and so is `knn` next to `sort` (the ordering is
+  the ANN nearest-first order; the store rejects the combination anyway, and
+  a valid-but-unhonorable request must be a 400, not the store's 500).
+- **Members**: `field` + `query_vector` (required) → SearchSpec;
+  `k` → `plan.Limit`, defaulting to the top-level `size`, itself defaulting
+  to 10 (ES's own default chain); top-level `from` → `plan.Offset` via the
+  existing paging path; `filter` (single clause
+  or array = AND) lowers through the same query IR → fold → buildExpr
+  machinery into `plan.Expr` as the scalar pre-filter (a filter that folds to
+  match_none makes the whole plan NoMatch — nothing for ANN to return);
+  `num_candidates` accepted but ignored (Milvus tunes its own ANN width; the
+  member only affects recall quality, not semantics); `boost`/`_name`
+  silently ignored (project convention); `similarity` (score floor) is
+  `unsupported_exception` — it needs Milvus range search, v1 does not.
+  Known approximation: ES windows from/size over the k results; here an
+  explicit `k` replaces `size` as the window (the store ANN-fetches
+  offset+k rows, not offset+size of a top-k), so `size` only seeds k's
+  default — pinned by an e2e case.
+- **Error split** follows the package taxonomy: shape errors
+  (query_vector not an array, missing required members, unknown parameters)
+  → `parsing_exception`; bad values (non-numeric vector elements, empty
+  vector, `k` below 1 or non-integer) → `illegal_argument_exception`;
+  capability gaps → `unsupported_exception`; all 400.
+- **Metric stays empty**: ES semantics take the distance from the
+  `dense_vector` mapping's `similarity` parameter, never from the query, so
+  the search rides the index metric (the empty-Metric store contract — no
+  `metric_type` search param; that is the pgvector operator's
+  point-at-the-metric semantics).
+- **Vector kind fp32-only**: `translateFieldType` now maps only FloatVector
+  → `TypeVector`; fp16/bf16/binary/sparse fall back to `TypeUnknown`, so a
+  knn targeting them fails with a clean local translation error instead of a
+  server-side type mismatch (the store only ever sends `[]float32`).
+- **Known approximations**: `_score` stays the constant 1.0 — ES's real knn
+  scores need the metric-specific normalization formulas
+  (cosine / l2_norm / dot_product), a Phase 5 job to be written against the
+  ES docs, not from memory. `hits.total.value` is the returned row count with
+  relation `eq` — a knn hit count has no cheap truth (same as the pg side's
+  Total=topk), so the number is honest about what came back, not about the
+  collection. The query-level `knn` (inside `query`) stays rejected.
 
 ## Settled — IR placement: query-level IR stays frontend-private (2026-09-13)
 

@@ -71,6 +71,10 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
     functions + unit tests)
   - [x] store wiring: Milvus client executes the plan (`internal/store`), `_search`
     endpoint live (`internal/esserver`)
+  - [x] ES knn vector search: the top-level `knn` clause runs the Milvus ANN
+    path (metric follows the field's index mapping, `k`/`from`/`size` window
+    it, scalar `filter` clauses ride along; array form and score fusion with
+    `query` fail fast)
 - [x] **Phase 2** PG read-only subset: wire protocol up, psql connects,
   `SELECT .. WHERE .. LIMIT` translation
   - [x] translation layer (`internal/translate/pg`: SQL → `Select` →

@@ -123,7 +123,11 @@ type hitItem struct {
 
 func (s *Server) writeSearchResult(w http.ResponseWriter, index string, plan *translate.Plan, result *store.SearchResult, took time.Duration) {
 	// Phase 1 scores are constant: 1.0 without a sort, null with one — the
-	// same shape ES emits for sort-only searches.
+	// same shape ES emits for sort-only searches. knn hits ride the same
+	// constant even though they have real distances: ES's metric-specific
+	// _score normalization (cosine / l2_norm / dot_product formulas) is a
+	// Phase 5 job, to be written against the ES docs, not from memory. The
+	// nearest-first ordering is already correct — the store preserves it.
 	sorted := len(plan.Sort) > 0
 	one := 1.0
 	score := func() *float64 {

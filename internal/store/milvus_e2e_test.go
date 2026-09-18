@@ -342,6 +342,39 @@ func TestMilvusExecutorE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("search without a metric rides the index default (L2 fixture)", func(t *testing.T) {
+		// the ES knn shape: the query names no metric, the collection's
+		// index (L2 here) supplies it
+		plan := &translate.Plan{
+			Limit:  3,
+			Source: fetchSource(),
+			Search: &translate.SearchSpec{Field: "emb", Vector: []float32{0.1, 0.2, 0.3, 0.4}},
+		}
+		res := mustSearch(t, ctx, exec, plan)
+		for i, want := range []string{"1", "2", "3"} {
+			if res.Hits[i].ID != want {
+				t.Errorf("hit %d = %s, want %s (index metric, nearest-first)", i, res.Hits[i].ID, want)
+			}
+		}
+	})
+
+	t.Run("search without a metric rides the index default (cosine fixture)", func(t *testing.T) {
+		plan := &translate.Plan{
+			Limit:  5,
+			Source: fetchSource(),
+			Search: &translate.SearchSpec{Field: "emb", Vector: []float32{1, 0, 0, 0}},
+		}
+		res, err := exec.Search(ctx, milvustest.VectorCollection, plan)
+		if err != nil {
+			t.Fatalf("metric-less cosine search: %v", err)
+		}
+		for i, want := range []string{"1", "2", "3", "4", "5"} {
+			if res.Hits[i].ID != want {
+				t.Errorf("hit %d = %s, want %s (index metric, nearest-first)", i, res.Hits[i].ID, want)
+			}
+		}
+	})
+
 	t.Run("metric disagreeing with the index fails", func(t *testing.T) {
 		plan := &translate.Plan{
 			Limit:  1,

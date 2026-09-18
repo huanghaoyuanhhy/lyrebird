@@ -18,7 +18,7 @@ const (
 // result set or response shape in ways Phase 1 cannot honor. Failing fast
 // with a named member beats silently returning a wrong-shaped response.
 var unsupportedFeatures = []string{
-	"aggs", "aggregations", "knn", "suggest", "collapse", "rescore",
+	"aggs", "aggregations", "suggest", "collapse", "rescore",
 	"post_filter", "search_after", "scroll", "pit", "slice", "min_score",
 	"indices_boost", "script_fields", "runtime_mappings", "highlight",
 	"stored_fields", "docvalue_fields", "fields", "terminate_after",
@@ -43,7 +43,8 @@ func unsupportedErrf(format string, args ...any) *translate.Error {
 //
 // Supported queries: match_all, match_none, bool (must/filter/should/must_not,
 // minimum_should_match), term, terms, match, range, exists. Supported body
-// members: from, size, sort, _source. Anything else that would change results
+// members: from, size, sort, _source, and the top-level knn clause (single
+// object form — see knn.go). Anything else that would change results
 // or response shape fails fast as unsupported_exception naming the member.
 func Translate(body []byte, schema translate.Schema) (*translate.Plan, error) {
 	if schema == nil {
@@ -82,6 +83,29 @@ func Translate(body []byte, schema translate.Schema) (*translate.Plan, error) {
 	}
 
 	plan := &translate.Plan{Offset: from, Limit: size, Sort: sorts, Source: source}
+
+	if knnRaw, ok := top["knn"]; ok {
+		if _, has := top["query"]; has {
+			return nil, unsupportedErrf("[knn] cannot be combined with [query]: fusing their scores is beyond lyrebird's surface; send one or the other")
+		}
+		if len(sorts) > 0 {
+			return nil, unsupportedErrf("[knn] cannot be combined with [sort]: the ordering is the ANN nearest-first order")
+		}
+		c, err := parseKnn(knnRaw)
+		if err != nil {
+			return nil, err
+		}
+		if c.kSet {
+			plan.Limit = c.k
+		}
+		plan.Search = &translate.SearchSpec{Field: c.field, Vector: c.vector}
+		// The knn filter is a scalar pre-filter: it narrows the ANN candidate
+		// set, so it lowers into the same plan.Expr a query clause would fill.
+		// Reusing the boolQuery/fold/buildExpr path keeps match_all /
+		// match_none semantics identical to query-side filters.
+		root = boolQuery{filter: c.filter}
+	}
+
 	if isMatchNone(root) {
 		plan.NoMatch = true
 		return plan, nil

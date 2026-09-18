@@ -218,11 +218,13 @@ func (e *MilvusExecutor) vectorSearch(ctx context.Context, collection string, pl
 		WithOutputFields(proj.fetch...).
 		WithOffset(plan.Offset)
 	if spec.Metric != "" {
-		// The operator's metric is the one semantic statement pgvector makes
-		// that the index cannot supply: `<=>` means cosine, not whatever the
-		// collection was indexed with. The server rejects a metric that
-		// disagrees with the field's index, so a cosine question never comes
-		// back answered by L2 distances.
+		// A filled metric is a semantic statement the protocol made: the
+		// pgvector operators name their metric (`<=>` means cosine, not
+		// whatever the collection was indexed with), so the server rejects
+		// a metric that disagrees with the field's index and a cosine
+		// question never comes back answered by L2 distances. ES knn stays
+		// empty instead — its metric lives in the mapping, so the search
+		// rides the index default (docs/design.md, ES knn notes).
 		opt.WithSearchParam("metric_type", string(spec.Metric))
 	}
 
@@ -452,12 +454,14 @@ func translateFieldType(f *entity.Field) translate.FieldType {
 		return translate.TypeNumber
 	case entity.FieldTypeBool:
 		return translate.TypeBool
-	case entity.FieldTypeFloatVector, entity.FieldTypeFloat16Vector, entity.FieldTypeBFloat16Vector:
-		return translate.TypeVector // the fields pgvector distance operators target
+	case entity.FieldTypeFloatVector:
+		return translate.TypeVector // fp32: the only vector family searches send (SearchSpec.Vector is []float32)
 	default:
-		// JSON, Array, binary/sparse vectors: no scalar vocabulary fits;
-		// translators treat unknown fields permissively and Milvus rejects
-		// nonsense filters.
+		// JSON, Array, and non-fp32 vector families (fp16/bf16, binary,
+		// sparse): no scalar vocabulary fits, and a search targeting them
+		// must fail at translation time (unknown field type) instead of
+		// mismatching the server-side storage type. Translators treat
+		// unknown fields permissively; Milvus rejects nonsense filters.
 		return translate.TypeUnknown
 	}
 }

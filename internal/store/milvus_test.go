@@ -192,6 +192,11 @@ func TestTranslateFieldType(t *testing.T) {
 		{entity.NewField().WithName("b").WithDataType(entity.FieldTypeBool), translate.TypeBool},
 		{entity.NewField().WithName("j").WithDataType(entity.FieldTypeJSON), translate.TypeUnknown},
 		{entity.NewField().WithName("v").WithDataType(entity.FieldTypeFloatVector).WithDim(4), translate.TypeVector},
+		// only fp32 maps to TypeVector: SearchSpec.Vector is []float32, so
+		// the other vector families must fail at translation time, not
+		// mismatch server-side
+		{entity.NewField().WithName("v16").WithDataType(entity.FieldTypeFloat16Vector).WithDim(4), translate.TypeUnknown},
+		{entity.NewField().WithName("bv16").WithDataType(entity.FieldTypeBFloat16Vector).WithDim(4), translate.TypeUnknown},
 		{entity.NewField().WithName("bv").WithDataType(entity.FieldTypeBinaryVector).WithDim(8), translate.TypeUnknown},
 		{entity.NewField().WithName("sv").WithDataType(entity.FieldTypeSparseVector), translate.TypeUnknown},
 	}
