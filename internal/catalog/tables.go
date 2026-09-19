@@ -152,9 +152,18 @@ var catalogTables = []tableDef{
 			col("oid", OIDOID), col("nspname", OIDName), col("nspowner", OIDOID), col("nspacl", OIDTextArray),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
-			// one schema per database: public. Milvus databases surface as PG
-			// databases, never as schemas.
-			return [][]any{{float64(publicNSOID), "public", float64(ownerOID), nil}}, nil
+			// the schema list real PostgreSQL presents: pgjdbc's
+			// getMaxNameLength joins pg_namespace on nspname='pg_catalog',
+			// and getTables' table-type CASE special-cases
+			// information_schema, so these rows exist even though the
+			// catalog tables under them stay empty. Milvus databases
+			// surface as PG databases, never as schemas.
+			return [][]any{
+				{float64(99), "pg_toast", float64(ownerOID), nil},
+				{float64(11), "pg_catalog", float64(ownerOID), nil},
+				{float64(13003), "information_schema", float64(ownerOID), nil},
+				{float64(publicNSOID), "public", float64(ownerOID), nil},
+			}, nil
 		},
 	},
 	{
@@ -167,18 +176,20 @@ var catalogTables = []tableDef{
 			col("relpersistence", OIDChar), col("relnatts", OIDInt2), col("relrowsecurity", OIDBool),
 			col("relforcerowsecurity", OIDBool), col("relispartition", OIDBool),
 			col("relispopulated", OIDBool), col("relreplident", OIDChar), col("reltoastrelid", OIDOID),
+			col("relacl", OIDText),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
 			return collectionRows(ctx, s, func(coll CollectionMeta, tableOID uint64) ([][]any, error) {
-				return [][]any{{
-					float64(tableOID), coll.Name, float64(publicNSOID),
-					"r", float64(ownerOID), float64(0),
-					float64(0), float64(0), float64(0),
-					false, false, false,
-					"p", float64(len(coll.Fields)), false,
-					false, false,
-					true, "d", float64(0),
-				}}, nil
+			return [][]any{{
+				float64(tableOID), coll.Name, float64(publicNSOID),
+				"r", float64(ownerOID), float64(0),
+				float64(0), float64(0), float64(0),
+				false, false, false,
+				"p", float64(len(coll.Fields)), false,
+				false, false,
+				true, "d", float64(0),
+				nil,
+			}}, nil
 			})
 		},
 	},
@@ -191,6 +202,7 @@ var catalogTables = []tableDef{
 			col("attinhcount", OIDInt4), col("attidentity", OIDChar), col("attgenerated", OIDChar),
 			col("attbyval", OIDBool), col("attalign", OIDChar), col("attstorage", OIDChar),
 			col("attstattarget", OIDInt4), col("attndims", OIDInt2), col("attcacheoff", OIDInt4),
+			col("attacl", OIDText),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
 			return collectionRows(ctx, s, func(coll CollectionMeta, tableOID uint64) ([][]any, error) {
@@ -203,7 +215,8 @@ var catalogTables = []tableDef{
 						!f.Nullable, false, true,
 						float64(0), "", "",
 						typByVal(oid), typAlign(oid), typStorage(oid),
-						float64(-1), float64(0), float64(-1)))
+						float64(-1), float64(0), float64(-1),
+						nil))
 				}
 				return rows, nil
 			})
@@ -315,9 +328,14 @@ var catalogTables = []tableDef{
 		cols: []colDef{
 			col("oid", OIDOID), col("proname", OIDName), col("pronamespace", OIDOID),
 			col("prokind", OIDChar), col("prorettype", OIDOID), col("pronargs", OIDInt2),
+			col("proretset", OIDBool), col("proargtypes", OIDOIDVector),
+			col("proallargtypes", OIDOIDArray), col("proargmodes", OIDTextArray),
+			col("proargnames", OIDTextArray), col("prosrc", OIDText),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
-			return nil, nil // no stored procedures
+			return nil, nil // no stored procedures: procedure-family queries
+			// (getProcedures, getFunctions, …) join this table and come back
+			// empty, which is the truthful answer
 		},
 	},
 	{

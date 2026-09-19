@@ -1,7 +1,7 @@
 package catalog
 
 import (
-	"context"
+	"strconv"
 	"strings"
 )
 
@@ -9,6 +9,13 @@ import (
 // the output shape comes from the static table definitions, rows come at
 // Exec time from a Provider snapshot.
 func Prepare(query string) (*Statement, error) {
+	// named special cases first: the client shapes they serve (derived
+	// tables, window functions, table functions) cannot parse through the
+	// general engine at all, and their output columns are part of the case
+	if result, ok := matchSpecial(query); ok {
+		return &Statement{cols: result.cols, st: &stmt{maxParam: maxParamOf(query)}, special: result}, nil
+	}
+
 	st, err := parseSQL(query)
 	if err != nil {
 		return nil, err
@@ -30,10 +37,6 @@ func Prepare(query string) (*Statement, error) {
 			return nil, capErrf("catalog queries support [LEFT] JOIN, not %s JOIN", strings.ToUpper(src.kind))
 		}
 		bound[i] = boundDef{spec: src, def: def}
-	}
-
-	if result, ok := matchSpecial(st, bound); ok {
-		return &Statement{cols: result.cols, st: st, sources: sources, defs: defsOf(bound), special: result}, nil
 	}
 
 	// function whitelist + output shape, both resolved from the static
@@ -73,6 +76,25 @@ func Prepare(query string) (*Statement, error) {
 // ParamCount reports the highest $n referenced, so the wire layer can
 // announce the parameter count in ParameterDescription.
 func (s *Statement) ParamCount() int { return s.st.maxParam }
+
+// maxParamOf scans a query's tokens for the highest $n (the special-case
+// path never builds an AST, so it counts from the text).
+func maxParamOf(query string) int {
+	toks, err := lex(query)
+	if err != nil {
+		return 0
+	}
+	max := 0
+	for _, t := range toks {
+		if t.kind != tkParam {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(t.text, "$")); err == nil && n > max {
+			max = n
+		}
+	}
+	return max
+}
 
 // validateFunctions rejects function calls outside the whitelist at prepare
 // time, so RowDescription never announces a query the engine cannot run.
@@ -326,10 +348,3 @@ func ReferencesCatalogTables(sql string) bool {
 	return false
 }
 
-// specialResult is a named special case's execution plan: explicit output
-// columns and a runner that generates rows directly, bypassing the general
-// engine (see special.go for the registry).
-type specialResult struct {
-	cols []Col
-	run  func(ctx context.Context, snap *snapshot) ([][]any, error)
-}

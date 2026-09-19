@@ -26,6 +26,9 @@ const (
 	OIDUUID    uint32 = 2950
 	OIDJSONB   uint32 = 3802
 
+	// OIDOIDVector is pg_proc.proargtypes' pseudo-type.
+	OIDOIDVector uint32 = 30
+
 	// Array twins the catalog itself uses (conkey/confkey, indkey).
 	OIDInt2Array  uint32 = 1005
 	OIDInt4Array  uint32 = 1007
@@ -73,6 +76,7 @@ var sysTypes = []sysType{
 	{OIDNumeric, "numeric", -1, "b", "N", 0},
 	{OIDUUID, "uuid", 16, "b", "U", 0},
 	{OIDJSONB, "jsonb", -1, "b", "U", 0},
+	{OIDOIDVector, "oidvector", -1, "b", "P", 0},
 	// array twins (typlen -1, typtype 'b', category 'A')
 	{OIDBoolArray, "_bool", -1, "b", "A", 0},
 	{OIDInt2Array, "_int2", -1, "b", "A", 0},

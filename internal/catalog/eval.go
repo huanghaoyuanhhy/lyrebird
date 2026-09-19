@@ -625,7 +625,12 @@ func (ec *evalCtx) evalBinary(x binExpr, c combo) (any, error) {
 		}
 		res := compareValues(l, lo) >= 0 && compareValues(l, hi) <= 0
 		return res != x.not, nil
-	case "+", "-", "*", "/":
+	case "+", "-", "*", "/", "||":
+		if x.op == "||" {
+			ls, _ := toString(l)
+			rs, _ := toString(r)
+			return ls + rs, nil
+		}
 		lf, lok := toFloat(l)
 		rf, rok := toFloat(r)
 		if !lok || !rok {
@@ -814,7 +819,7 @@ func coerceCast(v any, target string) (any, error) {
 	case "text", "varchar", "bpchar", "char", "name", "string":
 		s, _ := toString(v)
 		return s, nil
-	case "int2", "int4", "int8", "integer", "smallint", "bigint", "oid",
+	case "int2", "int4", "int8", "integer", "smallint", "bigint",
 		"float4", "float8", "real", "double precision", "numeric":
 		if v == nil {
 			return nil, nil
@@ -829,7 +834,9 @@ func coerceCast(v any, target string) (any, error) {
 			return nil, nil
 		}
 		return truth(v), nil
+	default:
+		// regclass/regtype/oidvector and everything else: identity text
+		s, _ := toString(v)
+		return s, nil
 	}
-	s, _ := toString(v)
-	return s, nil
 }

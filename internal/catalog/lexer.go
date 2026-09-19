@@ -38,15 +38,15 @@ var keywords = map[string]bool{
 	"LIKE": true, "ILIKE": true, "BETWEEN": true, "DISTINCT": true,
 	"CASE": true, "WHEN": true, "THEN": true, "ELSE": true, "END": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
-	"OUTER": true, "CROSS": true, "ON": true, "USING": true,
+	"OUTER": true, "CROSS": true, "ON": true, "USING": true, "FOR": true,
 	"CAST": true, "EXISTS": true,
 }
 
 // operators lists the operator/punctuation tokens longest first, so "!~"
-// wins over "!" and "<=" over "<".
+// wins over "!" and "::" over ":".
 var operators = []string{
 	"<=", ">=", "<>", "!=", "!~*", "~*", "!~", "~", "~~", "!~~",
-	"=", "<", ">", "(", ")", ",", ".", "[", "]", ";", "*", "+", "-", "/",
+	"||", "::", "=", "<", ">", "(", ")", ",", ".", "[", "]", ";", "*", "+", "-", "/",
 }
 
 // lex turns the statement into a token stream ending with tkEOF.

@@ -144,11 +144,15 @@ func TestPgNamespaceFiltered(t *testing.T) {
 		`AND nspname <> 'pg_toast_temp_1' AND (nspname !~ '^pg_toast_temp_' OR nspname = current_schemas(true)[1]) ` +
 		`ORDER BY "TABLE_SCHEM"`
 	rows := runQuery(t, sql)
-	if len(rows) != 1 {
-		t.Fatalf("schemas = %d rows, want exactly public", len(rows))
+	// real PG answers this with information_schema, pg_catalog and public —
+	// the pg_toast/pg_temp filters keep everything else out
+	var got []string
+	for _, r := range rows {
+		s, _ := toString(r[0])
+		got = append(got, s)
 	}
-	if s, _ := toString(rows[0][0]); s != "public" {
-		t.Errorf("schema = %q, want public", rows[0][0])
+	if strings.Join(got, ",") != "information_schema,pg_catalog,public" {
+		t.Errorf("schemas = %v, want the three real-PG schemas", got)
 	}
 }
 

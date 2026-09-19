@@ -177,6 +177,53 @@ func init() {
 		return float64(0), nil
 	})
 	register("txid_current", OIDInt8, 0, func(ec *evalCtx, _ []any) (any, error) { return float64(1), nil })
+
+	register("replace", OIDText, 3, func(ec *evalCtx, args []any) (any, error) {
+		if args[0] == nil {
+			return nil, nil
+		}
+		s, _ := toString(args[0])
+		from, _ := toString(args[1])
+		to, _ := toString(args[2])
+		return strings.ReplaceAll(s, from, to), nil
+	})
+	register("substring", OIDText, -1, func(ec *evalCtx, args []any) (any, error) {
+		if len(args) < 2 || args[0] == nil {
+			return nil, nil
+		}
+		s, _ := toString(args[0])
+		start, ok := toFloat(args[1])
+		if !ok {
+			return nil, errf(0, "substring start must be a number")
+		}
+		// PostgreSQL positions are 1-based; start 0 clamps to 1
+		begin := int(start) - 1
+		if begin < 0 {
+			begin = 0
+		}
+		if begin > len(s) {
+			begin = len(s)
+		}
+		end := len(s)
+		if len(args) > 2 {
+			length, ok := toFloat(args[2])
+			if !ok {
+				return nil, errf(0, "substring length must be a number")
+			}
+			if n := begin + int(length); n < end {
+				end = n
+			}
+			if end < begin {
+				end = begin
+			}
+		}
+		return s[begin:end], nil
+	})
+
+	// function decompilers alongside the other pg_get_* stubs
+	registerNul("pg_get_function_result", 1)
+	registerNul("pg_get_function_arguments", 1)
+	registerNul("pg_get_function_identity_arguments", 1)
 }
 
 func quoteText(ec *evalCtx, args []any) (any, error) {

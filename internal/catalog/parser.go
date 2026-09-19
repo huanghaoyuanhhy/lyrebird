@@ -589,12 +589,13 @@ func (p *parser) parseParenList() ([]expr, error) {
 	return list, nil
 }
 
+// parseAdditive handles +, - and string concatenation (||).
 func (p *parser) parseAdditive() (expr, error) {
 	left, err := p.parseMultiplicative()
 	if err != nil {
 		return nil, err
 	}
-	for p.isOp("+") || p.isOp("-") {
+	for p.isOp("+") || p.isOp("-") || p.isOp("||") {
 		op := p.next().text
 		right, err := p.parseMultiplicative()
 		if err != nil {
@@ -706,20 +707,11 @@ func (p *parser) parseIdentExpr() (expr, error) {
 		p.next()
 		var args []expr
 		if !p.isOp(")") {
-			for {
-				// DISTINCT inside arg lists (COUNT(DISTINCT x)) is accepted
-				// and ignored — the whitelist rejects aggregates anyway.
-				p.acceptKeyword("DISTINCT")
-				arg, err := p.parseExpr()
-				if err != nil {
-					return nil, err
-				}
-				args = append(args, arg)
-				if p.acceptOp(",") {
-					continue
-				}
-				break
+			parsed, err := p.parseFunctionArgs(strings.Join(parts, "."))
+			if err != nil {
+				return nil, err
 			}
+			args = parsed
 		}
 		if err := p.expectOp(")"); err != nil {
 			return nil, err
@@ -731,6 +723,45 @@ func (p *parser) parseIdentExpr() (expr, error) {
 		return p.postfix(colRef{name: parts[0]})
 	}
 	return p.postfix(colRef{tbl: parts[len(parts)-2], name: parts[len(parts)-1]})
+}
+
+// parseFunctionArgs parses a call's argument list. SUBSTRING(x FROM start
+// [FOR len]) is the one SQL function whose arguments use keywords — its
+// FROM-tail folds into positional form (substring(text, start[, len])) so
+// the whitelist sees one shape regardless of how the client wrote it.
+func (p *parser) parseFunctionArgs(name string) ([]expr, error) {
+	var args []expr
+	arg, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, arg)
+	if p.acceptKeyword("FROM") {
+		start, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, start)
+		if p.acceptKeyword("FOR") {
+			length, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, length)
+		}
+		return args, nil
+	}
+	for p.acceptOp(",") {
+		// DISTINCT inside arg lists is accepted and ignored — the whitelist
+		// rejects aggregates anyway.
+		p.acceptKeyword("DISTINCT")
+		arg, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+	}
+	return args, nil
 }
 
 // parseCase handles both CASE forms: searched (CASE WHEN cond THEN …) and
@@ -821,18 +852,43 @@ func (p *parser) parseCast() (expr, error) {
 	return p.postfix(castExpr{e: e, target: target})
 }
 
-// postfix applies trailing subscript operators: current_schemas(true)[1].
+// postfix applies trailing operators: subscripts (current_schemas(true)[1])
+// and casts (x::text, 'pg_class'::regclass).
 func (p *parser) postfix(e expr) (expr, error) {
-	for p.isOp("[") {
-		p.next()
-		idx, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+	for {
+		switch {
+		case p.isOp("["):
+			p.next()
+			idx, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp("]"); err != nil {
+				return nil, err
+			}
+			e = subscriptExpr{base: e, idx: idx}
+		case p.isOp("::"):
+			p.next()
+			t := p.peek()
+			if t.kind != tkIdent {
+				return nil, errf(t.pos, "expected a type name after ::, got [%s]", tokenText(t))
+			}
+			target := foldIdent(p.next())
+			// swallow type parameters: ::varchar(64), ::numeric(10,2)
+			if p.acceptOp("(") {
+				depth := 1
+				for depth > 0 && p.peek().kind != tkEOF {
+					switch p.next().text {
+					case "(":
+						depth++
+					case ")":
+						depth--
+					}
+				}
+			}
+			e = castExpr{e: e, target: target}
+		default:
+			return e, nil
 		}
-		if err := p.expectOp("]"); err != nil {
-			return nil, err
-		}
-		e = subscriptExpr{base: e, idx: idx}
 	}
-	return e, nil
 }
