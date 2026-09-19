@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus/client/v2/column"
-	"github.com/milvus-io/milvus/client/v2/entity"
-	"github.com/milvus-io/milvus/client/v2/milvusclient"
+	"github.com/milvus-io/milvus/client/v3/column"
+	"github.com/milvus-io/milvus/client/v3/entity"
+	"github.com/milvus-io/milvus/client/v3/milvusclient"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
@@ -26,7 +26,7 @@ type MilvusConfig struct {
 
 // MilvusExecutor is the real Executor: it renders plans into Milvus boolean
 // expressions and runs them through the official milvus Go client
-// (milvus-io/milvus/client/v2). It is the only place in lyrebird that
+// (milvus-io/milvus/client/v3). It is the only place in lyrebird that
 // speaks to Milvus.
 type MilvusExecutor struct {
 	cli *milvusclient.Client
