@@ -16,19 +16,20 @@ import (
 
 // Server serves the endpoint subset that ES clients can talk to directly.
 type Server struct {
-	exec   store.Executor
-	logger *zap.Logger
-	mux    *http.ServeMux
+	cluster store.Cluster
+	logger  *zap.Logger
+	mux     *http.ServeMux
 }
 
-// New constructs the ES-compatible server around an executor (the real
+// New constructs the ES-compatible server around a cluster (the real
 // MilvusExecutor, or the LogExecutor for development without a cluster).
 // A nil logger falls back to the global zap logger.
-func New(exec store.Executor, logger *zap.Logger) *Server {
-	s := &Server{exec: exec, logger: logger, mux: http.NewServeMux()}
+func New(cluster store.Cluster, logger *zap.Logger) *Server {
+	s := &Server{cluster: cluster, logger: logger, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /{$}", s.clusterInfo)
 	s.mux.HandleFunc("POST /{index}/_search", s.search)
 	s.mux.HandleFunc("GET /{index}/_search", s.search)
+	s.installCatalogRoutes()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})

@@ -33,6 +33,10 @@ type Cluster interface {
 	Databases(ctx context.Context) ([]string, error)
 	ListCollections(ctx context.Context, db string) ([]string, error)
 	Collection(ctx context.Context, db, name string) (catalog.CollectionMeta, error)
+
+	// CollectionStats reports the entity count of one collection (the ES
+	// _cat docs.count); 0 when unknown.
+	CollectionStats(ctx context.Context, db, name string) (int64, error)
 }
 
 var _ Cluster = (*MilvusExecutor)(nil)
@@ -121,6 +125,21 @@ func (e *MilvusExecutor) Collection(ctx context.Context, db, name string) (catal
 	return catalogMeta(coll), nil
 }
 
+// CollectionStats implements Cluster: the collection's row count, the ES
+// _cat docs.count.
+func (e *MilvusExecutor) CollectionStats(ctx context.Context, db, name string) (int64, error) {
+	cli, err := e.clientFor(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	stats, err := cli.GetCollectionStats(ctx, milvusclient.NewGetCollectionStatsOption(name))
+	if err != nil {
+		return 0, fmt.Errorf("collection stats for %q: %w", name, err)
+	}
+	n, _ := strconv.ParseInt(stats["row_count"], 10, 64)
+	return n, nil
+}
+
 // catalogMeta projects a described collection onto the catalog vocabulary.
 func catalogMeta(coll *entity.Collection) catalog.CollectionMeta {
 	meta := catalog.CollectionMeta{Name: coll.Schema.CollectionName}
@@ -136,6 +155,7 @@ func catalogMeta(coll *entity.Collection) catalog.CollectionMeta {
 			Nullable:   f.Nullable,
 			Dim:        typeParamInt(f.TypeParams, "dim"),
 			MaxLength:  typeParamInt(f.TypeParams, "max_length"),
+			Native:     nativeTypeName(f.DataType),
 		})
 	}
 	return meta
@@ -144,4 +164,49 @@ func catalogMeta(coll *entity.Collection) catalog.CollectionMeta {
 func typeParamInt(params map[string]string, key string) int {
 	n, _ := strconv.Atoi(params[key])
 	return n
+}
+
+// nativeTypeName spells a Milvus field type in the catalog's canonical
+// vocabulary — deliberately not entity.FieldType.String(), whose names
+// collide (VarChar/Text/String all "string"; three vector kinds "[]byte").
+// Only the store knows the enum; the protocol layers map these names.
+func nativeTypeName(t entity.FieldType) string {
+	switch t {
+	case entity.FieldTypeBool:
+		return "bool"
+	case entity.FieldTypeInt8:
+		return "int8"
+	case entity.FieldTypeInt16:
+		return "int16"
+	case entity.FieldTypeInt32:
+		return "int32"
+	case entity.FieldTypeInt64:
+		return "int64"
+	case entity.FieldTypeFloat:
+		return "float32"
+	case entity.FieldTypeDouble:
+		return "float64"
+	case entity.FieldTypeString, entity.FieldTypeVarChar, entity.FieldTypeText:
+		return "string"
+	case entity.FieldTypeJSON:
+		return "json"
+	case entity.FieldTypeArray:
+		return "array"
+	case entity.FieldTypeFloatVector:
+		return "float_vector"
+	case entity.FieldTypeFloat16Vector:
+		return "float16_vector"
+	case entity.FieldTypeBFloat16Vector:
+		return "bfloat16_vector"
+	case entity.FieldTypeBinaryVector:
+		return "binary_vector"
+	case entity.FieldTypeInt8Vector:
+		return "int8_vector"
+	case entity.FieldTypeSparseVector:
+		return "sparse_float_vector"
+	case entity.FieldTypeTimestamptz:
+		return "timestamptz"
+	default:
+		return "unknown"
+	}
 }

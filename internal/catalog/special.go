@@ -266,22 +266,19 @@ func boolYesNo(b bool) string {
 	return "NO"
 }
 
-// catalogMetas describes every collection of the snapshot's database, with
-// its synthetic pg_class OID (the same convention the virtual tables use).
+// catalogMetas describes every collection of the snapshot's database — the
+// snapshot-cached list, so named cases and the virtual tables assign the
+// same synthetic OIDs within one execution.
 func catalogMetas(ctx context.Context, snap *snapshot) ([]CollectionMeta, error) {
-	names, err := snap.provider.ListCollections(ctx, snap.db)
+	metas, err := snap.collectionMetas(ctx)
 	if err != nil {
 		return nil, err
 	}
-	metas := make([]CollectionMeta, 0, len(names))
-	for _, name := range names {
-		coll, err := snap.provider.Collection(ctx, snap.db, name)
-		if err != nil {
-			return nil, err
-		}
-		metas = append(metas, coll)
+	out := make([]CollectionMeta, 0, len(metas))
+	for _, m := range metas {
+		out = append(out, m.meta)
 	}
-	return metas, nil
+	return out, nil
 }
 
 // pkKeyFields returns the primary-key fields of one collection in key order.

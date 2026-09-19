@@ -97,11 +97,28 @@ var serverParameters = wire.Parameters{
 	"TimeZone":                    "UTC",
 }
 
-// parse is the psql-wire entry point: one SQL statement in, one prepared
-// statement out. The three families dispatch here so the wire layer can
-// describe result columns before executing (RowDescription precedes the
-// rows it describes); the store is only hit inside statement bodies.
+// parse is the psql-wire entry point: one query string in, prepared
+// statements out. psql sends its \d family as one semicolon-separated
+// string and psql-wire does not split it, so the split happens here and
+// every statement answers in order, the way PostgreSQL does.
 func (s *Server) parse(ctx context.Context, query string) (wire.PreparedStatements, error) {
+	var all wire.PreparedStatements
+	for _, part := range catalog.SplitStatements(query) {
+		stmts, err := s.parseOne(ctx, part)
+		if err != nil {
+			return nil, err // PG aborts the whole string on the first error
+		}
+		all = append(all, stmts...)
+	}
+	return all, nil
+}
+
+// parseOne dispatches one statement: session statements, catalog
+// introspection, or a collection read. The three families route here so
+// the wire layer can describe result columns before executing
+// (RowDescription precedes the rows it describes); the store is only hit
+// inside statement bodies.
+func (s *Server) parseOne(ctx context.Context, query string) (wire.PreparedStatements, error) {
 	logger := s.zapLogger()
 
 	// 1. session statements: SET / SHOW / RESET / DISCARD / transactions.

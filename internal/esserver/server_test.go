@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,15 +13,20 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/huanghaoyuanhhy/lyrebird/internal/catalog"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
-// fakeExecutor returns canned results and records what it was asked.
+// fakeExecutor returns canned results and records what it was asked. It
+// also carries the cluster surface the catalog endpoints read: collections
+// (fixed metas) and a canned per-index stats map.
 type fakeExecutor struct {
 	schema translate.Schema
 	result *store.SearchResult
 	err    error
+	metas  []catalog.CollectionMeta
+	stats  map[string]int64
 
 	gotIndex string
 	gotPlan  *translate.Plan
@@ -39,7 +45,42 @@ func (f *fakeExecutor) Schema(ctx context.Context, collection string) (translate
 	return f.schema, nil
 }
 
-func serve(t *testing.T, exec store.Executor) *httptest.Server {
+// Database implements store.Cluster: one fake, any database.
+func (f *fakeExecutor) Database(db string) (store.Executor, error) { return f, nil }
+
+// DefaultDatabase implements store.Cluster.
+func (f *fakeExecutor) DefaultDatabase() string { return "default" }
+
+// Databases implements store.Cluster.
+func (f *fakeExecutor) Databases(ctx context.Context) ([]string, error) {
+	return []string{"default"}, nil
+}
+
+// ListCollections implements store.Cluster from the fake's metas.
+func (f *fakeExecutor) ListCollections(ctx context.Context, db string) ([]string, error) {
+	names := make([]string, 0, len(f.metas))
+	for _, m := range f.metas {
+		names = append(names, m.Name)
+	}
+	return names, nil
+}
+
+// Collection implements store.Cluster by name lookup.
+func (f *fakeExecutor) Collection(ctx context.Context, db, name string) (catalog.CollectionMeta, error) {
+	for _, m := range f.metas {
+		if m.Name == name {
+			return m, nil
+		}
+	}
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, name)
+}
+
+// CollectionStats implements store.Cluster from the canned stats map.
+func (f *fakeExecutor) CollectionStats(ctx context.Context, db, name string) (int64, error) {
+	return f.stats[name], nil
+}
+
+func serve(t *testing.T, exec store.Cluster) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(New(exec, zap.NewNop()))
 	t.Cleanup(srv.Close)
@@ -362,4 +403,28 @@ func (panickyExecutor) Search(ctx context.Context, collection string, plan *tran
 
 func (panickyExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {
 	return translate.MapSchema{}, nil
+}
+
+// Database implements store.Cluster: the panic test only reads.
+func (panickyExecutor) Database(db string) (store.Executor, error) { return nil, nil }
+
+// DefaultDatabase implements store.Cluster.
+func (panickyExecutor) DefaultDatabase() string { return "default" }
+
+// Databases implements store.Cluster.
+func (panickyExecutor) Databases(ctx context.Context) ([]string, error) { return nil, nil }
+
+// ListCollections implements store.Cluster.
+func (panickyExecutor) ListCollections(ctx context.Context, db string) ([]string, error) {
+	return nil, nil
+}
+
+// Collection implements store.Cluster.
+func (panickyExecutor) Collection(ctx context.Context, db, name string) (catalog.CollectionMeta, error) {
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, name)
+}
+
+// CollectionStats implements store.Cluster.
+func (panickyExecutor) CollectionStats(ctx context.Context, db, name string) (int64, error) {
+	return 0, nil
 }

@@ -39,7 +39,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	schema, err := s.exec.Schema(r.Context(), index)
+	schema, err := s.cluster.Schema(r.Context(), index)
 	if err != nil {
 		s.writeExecError(logger, w, index, err)
 		return
@@ -52,7 +52,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	result, err := s.exec.Search(r.Context(), index, plan)
+	result, err := s.cluster.Search(r.Context(), index, plan)
 	if err != nil {
 		s.writeExecError(logger, w, index, err)
 		return

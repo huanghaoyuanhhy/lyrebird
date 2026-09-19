@@ -35,6 +35,8 @@ type binExpr struct {
 	// not flips the comparison (NOT LIKE); only meaningful for the
 	// comparison-family operators.
 	not bool
+	// anyList marks the = ANY (expr) form: r is the array operand.
+	anyList bool
 }
 
 type isNullExpr struct {
@@ -69,6 +71,18 @@ type subscriptExpr struct {
 	idx  expr
 }
 
+// subqueryExpr is a scalar subquery: (SELECT expr …) evaluated against the
+// enclosing row (correlation falls through the evalCtx parent chain).
+type subqueryExpr struct {
+	st *stmt
+}
+
+// arraySubqueryExpr is ARRAY(SELECT …): every row's first output column as
+// an array value.
+type arraySubqueryExpr struct {
+	st *stmt
+}
+
 // stmt is one parsed SELECT.
 type stmt struct {
 	items    []selectItem
@@ -79,6 +93,15 @@ type stmt struct {
 	offset   expr
 	distinct bool
 	maxParam int
+	// union holds UNION / UNION ALL branches after the first select body
+	// (psql's describe queries end with a UNION'd publications probe); the
+	// first body owns the output shape, ORDER BY and LIMIT span the union.
+	union []unionBranch
+}
+
+type unionBranch struct {
+	st  *stmt
+	all bool
 }
 
 type selectItem struct {
@@ -180,42 +203,19 @@ func tokenText(t token) string {
 }
 
 func (p *parser) parseSelect() (*stmt, error) {
-	if !p.acceptKeyword("SELECT") {
-		return nil, errf(p.peek().pos, "expected SELECT, got [%s]", tokenText(p.peek()))
+	st, err := p.parseSelectCore()
+	if err != nil {
+		return nil, err
 	}
-	st := &stmt{}
-	st.distinct = p.acceptKeyword("DISTINCT")
+	st.maxParam = p.maxParam
 
-	for {
-		item, err := p.parseSelectItem()
+	for p.acceptKeyword("UNION") {
+		all := p.acceptKeyword("ALL")
+		branch, err := p.parseSelectCore()
 		if err != nil {
 			return nil, err
 		}
-		st.items = append(st.items, item)
-		if !p.acceptOp(",") {
-			break
-		}
-	}
-
-	if p.acceptKeyword("FROM") {
-		from, err := p.parseFrom()
-		if err != nil {
-			return nil, err
-		}
-		st.from = from
-	}
-
-	if p.acceptKeyword("WHERE") {
-		w, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		st.where = w
-	}
-
-	if p.isKeyword("GROUP") || p.isKeyword("HAVING") || p.isKeyword("UNION") ||
-		p.isKeyword("INTERSECT") || p.isKeyword("EXCEPT") || p.isKeyword("WINDOW") {
-		return nil, capErrf("catalog queries do not support %s", strings.ToLower(p.peek().text))
+		st.union = append(st.union, unionBranch{st: branch, all: all})
 	}
 
 	if p.acceptKeyword("ORDER") {
@@ -256,6 +256,50 @@ func (p *parser) parseSelect() (*stmt, error) {
 	}
 
 	if p.isKeyword("FOR") || p.isKeyword("FETCH") || p.isKeyword("INTO") {
+		return nil, capErrf("catalog queries do not support %s", strings.ToLower(p.peek().text))
+	}
+
+	return st, nil
+}
+
+// parseSelectCore parses one select body: the select list, FROM and WHERE —
+// everything above ORDER BY, which spans a UNION at the statement level.
+func (p *parser) parseSelectCore() (*stmt, error) {
+	if !p.acceptKeyword("SELECT") {
+		return nil, errf(p.peek().pos, "expected SELECT, got [%s]", tokenText(p.peek()))
+	}
+	st := &stmt{}
+	st.distinct = p.acceptKeyword("DISTINCT")
+
+	for {
+		item, err := p.parseSelectItem()
+		if err != nil {
+			return nil, err
+		}
+		st.items = append(st.items, item)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+
+	if p.acceptKeyword("FROM") {
+		from, err := p.parseFrom()
+		if err != nil {
+			return nil, err
+		}
+		st.from = from
+	}
+
+	if p.acceptKeyword("WHERE") {
+		w, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		st.where = w
+	}
+
+	if p.isKeyword("GROUP") || p.isKeyword("HAVING") || p.isKeyword("INTERSECT") ||
+		p.isKeyword("EXCEPT") || p.isKeyword("WINDOW") {
 		return nil, capErrf("catalog queries do not support %s", strings.ToLower(p.peek().text))
 	}
 
@@ -473,11 +517,46 @@ func (p *parser) parseComparison() (expr, error) {
 		return nil, err
 	}
 	for {
+		// COLLATE is a postfix no-op here (lyrebird owns no collations);
+		// clients attach it to operands in WHERE and ORDER BY
+		if p.acceptKeyword("COLLATE") {
+			if err := p.skipQualifiedName(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		// OPERATOR(pg_catalog.~) — the schema-qualified operator wrapper
+		// psql's describe queries use for regex matches
+		if left2, ok, err := p.parseOperatorWrapper(left); err != nil {
+			return nil, err
+		} else if ok {
+			left = left2
+			continue
+		}
 		switch {
 		case p.isOp("=") || p.isOp("<>") || p.isOp("!=") || p.isOp("<") ||
 			p.isOp(">") || p.isOp("<=") || p.isOp(">=") ||
 			p.isOp("~") || p.isOp("!~") || p.isOp("~*") || p.isOp("!~*"):
 			op := p.next().text
+			quantifier := ""
+			if p.acceptKeyword("ANY") || p.acceptKeyword("ALL") {
+				// SOME/ANY/ALL (expr): the right side becomes the array
+				quantifier = "any"
+				if err := p.expectOp("("); err != nil {
+					return nil, err
+				}
+				var err error
+				right, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return nil, err
+				}
+				left = binExpr{op: op, l: left, r: right, anyList: true}
+				_ = quantifier
+				continue
+			}
 			right, err := p.parseAdditive()
 			if err != nil {
 				return nil, err
@@ -548,6 +627,62 @@ func (p *parser) parseComparison() (expr, error) {
 			return left, nil
 		}
 	}
+}
+
+// skipQualifiedName consumes ident(.ident)* — a COLLATE source's tail.
+func (p *parser) skipQualifiedName() error {
+	t := p.peek()
+	if t.kind != tkIdent {
+		return errf(t.pos, "expected a name, got [%s]", tokenText(t))
+	}
+	p.next()
+	for p.isOp(".") {
+		p.next()
+		t := p.peek()
+		if t.kind != tkIdent {
+			return errf(t.pos, "expected a name after '.', got [%s]", tokenText(t))
+		}
+		p.next()
+	}
+	return nil
+}
+
+// parseOperatorWrapper consumes OPERATOR(schema.op) in infix position and
+// re-enters the comparison chain with it as the operator. ok is false when
+// the next tokens are not an OPERATOR wrapper.
+func (p *parser) parseOperatorWrapper(left expr) (expr, bool, error) {
+	if p.peek().kind != tkIdent || !strings.EqualFold(p.peek().text, "OPERATOR") {
+		return nil, false, nil
+	}
+	if p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
+		return nil, false, nil
+	}
+	p.next() // OPERATOR
+	p.next() // (
+	var parts []string
+	for {
+		t := p.peek()
+		if t.kind == tkOp && t.text == ")" {
+			p.next()
+			break
+		}
+		if t.kind == tkEOF {
+			return nil, false, errf(t.pos, "unterminated OPERATOR(…)")
+		}
+		parts = append(parts, t.text)
+		p.next()
+	}
+	op := parts[len(parts)-1] // the operator itself: pg_catalog.~ → ~
+	switch op {
+	case "=", "<", ">", "<=", ">=", "<>", "~", "!~", "~*", "!~*":
+	default:
+		return nil, false, capErrf("operator %q is not available in catalog queries", op)
+	}
+	right, err := p.parseAdditive()
+	if err != nil {
+		return nil, false, err
+	}
+	return binExpr{op: op, l: left, r: right}, true, nil
 }
 
 func (p *parser) parseBetweenTail() (expr, error) {
@@ -672,8 +807,33 @@ func (p *parser) parsePrimary() (expr, error) {
 		return p.parseCast()
 	case t.kind == tkKeyword && t.text == "EXISTS":
 		return nil, capErrf("catalog queries do not support EXISTS")
+	case t.kind == tkIdent && strings.EqualFold(t.text, "ARRAY") &&
+		p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" &&
+		p.toks[p.i+2].kind == tkKeyword && p.toks[p.i+2].text == "SELECT":
+		// ARRAY(SELECT …): the first output column of every subquery row
+		p.next()
+		p.next()
+		sub, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		return p.postfix(arraySubqueryExpr{st: sub})
 	case t.kind == tkOp && t.text == "(":
 		p.next()
+		// scalar subquery: (SELECT …) evaluated per outer row
+		if p.isKeyword("SELECT") {
+			sub, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+			return p.postfix(subqueryExpr{st: sub})
+		}
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, err
@@ -725,10 +885,10 @@ func (p *parser) parseIdentExpr() (expr, error) {
 	return p.postfix(colRef{tbl: parts[len(parts)-2], name: parts[len(parts)-1]})
 }
 
-// parseFunctionArgs parses a call's argument list. SUBSTRING(x FROM start
-// [FOR len]) is the one SQL function whose arguments use keywords — its
-// FROM-tail folds into positional form (substring(text, start[, len])) so
-// the whitelist sees one shape regardless of how the client wrote it.
+// parseFunctionArgs parses a call's argument list. SUBSTRING's keyword
+// argument forms fold into positional shape so the whitelist sees one
+// spelling: SUBSTRING(x FROM start [FOR len]) → substring(x, start[, len]),
+// SUBSTRING(x FOR len) → substring(x, 1, len).
 func (p *parser) parseFunctionArgs(name string) ([]expr, error) {
 	var args []expr
 	arg, err := p.parseExpr()
@@ -750,6 +910,13 @@ func (p *parser) parseFunctionArgs(name string) ([]expr, error) {
 			args = append(args, length)
 		}
 		return args, nil
+	}
+	if p.acceptKeyword("FOR") {
+		length, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return append(args, literal{v: float64(1)}, length), nil
 	}
 	for p.acceptOp(",") {
 		// DISTINCT inside arg lists is accepted and ignored — the whitelist
@@ -820,13 +987,35 @@ func (p *parser) parseCast() (expr, error) {
 	if err := p.expectKeyword("AS"); err != nil {
 		return nil, err
 	}
+	target, err := p.parseTypeName()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	return p.postfix(castExpr{e: e, target: target})
+}
+
+// parseTypeName reads a (possibly schema-qualified) type name and swallows
+// its modifiers: pg_catalog.varchar(64), numeric(10,2), timestamp(3) with
+// time zone. The target is the bare type (last segment), lower-cased.
+func (p *parser) parseTypeName() (string, error) {
 	t := p.peek()
 	if t.kind != tkIdent {
-		return nil, errf(t.pos, "expected a type name, got [%s]", tokenText(t))
+		return "", errf(t.pos, "expected a type name, got [%s]", tokenText(t))
 	}
 	target := foldIdent(p.next())
-	// swallow type modifiers: varchar(64), numeric(10,2), timestamp(3) with
-	// or without time zone
+	for p.isOp(".") {
+		p.next()
+		t := p.peek()
+		if t.kind != tkIdent {
+			return "", errf(t.pos, "expected a type name after '.', got [%s]", tokenText(t))
+		}
+		target = foldIdent(p.next())
+	}
+	// swallow type parameters and trailing words: varchar(64),
+	// timestamp(3) with time zone, double precision
 	if p.acceptOp("(") {
 		depth := 1
 		for depth > 0 && p.peek().kind != tkEOF {
@@ -843,13 +1032,10 @@ func (p *parser) parseCast() (expr, error) {
 		case "time", "zone", "with", "without", "precision":
 			p.next()
 		default:
-			return nil, errf(p.peek().pos, "unexpected token in CAST type: [%s]", p.peek().text)
+			return "", errf(p.peek().pos, "unexpected token in type name: [%s]", p.peek().text)
 		}
 	}
-	if err := p.expectOp(")"); err != nil {
-		return nil, err
-	}
-	return p.postfix(castExpr{e: e, target: target})
+	return target, nil
 }
 
 // postfix applies trailing operators: subscripts (current_schemas(true)[1])
@@ -869,22 +1055,9 @@ func (p *parser) postfix(e expr) (expr, error) {
 			e = subscriptExpr{base: e, idx: idx}
 		case p.isOp("::"):
 			p.next()
-			t := p.peek()
-			if t.kind != tkIdent {
-				return nil, errf(t.pos, "expected a type name after ::, got [%s]", tokenText(t))
-			}
-			target := foldIdent(p.next())
-			// swallow type parameters: ::varchar(64), ::numeric(10,2)
-			if p.acceptOp("(") {
-				depth := 1
-				for depth > 0 && p.peek().kind != tkEOF {
-					switch p.next().text {
-					case "(":
-						depth++
-					case ")":
-						depth--
-					}
-				}
+			target, err := p.parseTypeName()
+			if err != nil {
+				return nil, err
 			}
 			e = castExpr{e: e, target: target}
 		default:

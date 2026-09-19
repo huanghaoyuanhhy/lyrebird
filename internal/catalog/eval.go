@@ -56,11 +56,16 @@ type boundSource struct {
 	rows []map[string]any
 }
 
-// evalCtx evaluates expressions against one row combination.
+// evalCtx evaluates expressions against one row combination. parent links
+// a scalar subquery's context to the enclosing row: column references the
+// subquery cannot resolve locally fall through to the outer row
+// (correlation), the only subquery form the engine supports.
 type evalCtx struct {
 	snap    *snapshot
 	sources []boundSource
 	byAlias map[string]int // alias → index into sources
+	parent  *evalCtx
+	outer   combo // the enclosing row combination when parent != nil
 }
 
 // combo holds one candidate row: the current row (as a column→value map)
@@ -91,52 +96,83 @@ func (s *Statement) Exec(ctx context.Context, p Provider, db string, params []an
 		tables:   map[string]*tableData{},
 		settings: map[string]string{},
 		params:   params,
+		ctx:      ctx,
 	}
 
 	if s.special != nil {
 		return s.special.run(ctx, snap)
 	}
+	return runQuery(ctx, snap, s.st, s.sources, nil, nil)
+}
 
-	sources, err := s.bindSources(ctx, snap)
+// runQuery executes one parsed statement over a snapshot. parent/outer wire
+// a correlated scalar subquery to the enclosing row combination (nil at top
+// level); the FROM sources must already be registry-validated (Prepare or
+// the subquery walk does that).
+func runQuery(ctx context.Context, snap *snapshot, st *stmt, sources []sourceSpec, parent *evalCtx, outer combo) ([][]any, error) {
+	bound, err := bindSources(ctx, snap, sources)
 	if err != nil {
 		return nil, err
 	}
-	ec := &evalCtx{snap: snap, byAlias: map[string]int{}}
-	for i, src := range sources {
+	ec := &evalCtx{snap: snap, byAlias: map[string]int{}, parent: parent, outer: outer}
+	for i, src := range bound {
 		ec.sources = append(ec.sources, src)
 		ec.byAlias[src.spec.ref.alias] = i
 	}
 
-	combos, err := s.joinRows(ec)
+	combos, err := joinRows(ec)
 	if err != nil {
 		return nil, err
 	}
-
-	combos, err = s.filterRows(ec, combos)
+	combos, err = filterRows(ec, st, combos)
 	if err != nil {
 		return nil, err
 	}
-
-	proj, err := s.project(ec, combos)
+	proj, err := project(ec, st, combos)
 	if err != nil {
 		return nil, err
 	}
-	if s.st.distinct {
+	if st.distinct {
 		proj = distinctRows(proj)
 	}
 
-	if err := s.sortRows(ec, combos, proj); err != nil {
+	// UNION branches concatenate after the first body; the first body owns
+	// the output shape, and a bare UNION dedupes the whole result
+	for _, branch := range st.union {
+		rows, err := runQuery(ctx, snap, branch.st, flattenFrom(branch.st.from), parent, outer)
+		if err != nil {
+			return nil, err
+		}
+		proj = append(proj, rows...)
+	}
+	if len(st.union) > 0 && !st.union[len(st.union)-1].all {
+		proj = distinctRows(proj)
+	}
+
+	cols, err := inferColumns(st, boundDefsOf(bound))
+	if err != nil {
 		return nil, err
 	}
-	proj = windowRows(proj, s.st.offset, s.st.limit, ec)
-	return proj, nil
+	if err := sortRows(ec, st, cols, combos, proj); err != nil {
+		return nil, err
+	}
+	return windowRows(proj, st.offset, st.limit, ec), nil
+}
+
+// boundDefsOf pairs the bound sources with their definitions for inference.
+func boundDefsOf(bound []boundSource) []boundDef {
+	defs := make([]boundDef, len(bound))
+	for i, b := range bound {
+		defs[i] = boundDef{spec: b.spec, def: b.def}
+	}
+	return defs
 }
 
 // bindSources materializes every FROM source's virtual table once.
-func (s *Statement) bindSources(ctx context.Context, snap *snapshot) ([]boundSource, error) {
-	out := make([]boundSource, 0, len(s.sources))
-	for _, spec := range s.sources {
-		def := s.defFor(spec.ref)
+func bindSources(ctx context.Context, snap *snapshot, sources []sourceSpec) ([]boundSource, error) {
+	out := make([]boundSource, 0, len(sources))
+	for _, spec := range sources {
+		def := tableRegistry[spec.ref.name]
 		td, err := snap.table(ctx, def)
 		if err != nil {
 			return nil, err
@@ -154,14 +190,12 @@ func (s *Statement) bindSources(ctx context.Context, snap *snapshot) ([]boundSou
 	return out, nil
 }
 
-func (s *Statement) defFor(ref tableRef) *tableDef {
-	return tableRegistry[ref.name]
-}
+
 
 // joinRows builds every row combination the FROM clause produces: sources
 // extend left to right, each joining by its kind, LEFT keeping unmatched
 // combinations with an all-null row.
-func (s *Statement) joinRows(ec *evalCtx) ([]combo, error) {
+func joinRows(ec *evalCtx) ([]combo, error) {
 	combos := []combo{{}}
 	for i, src := range ec.sources {
 		next := []combo{}
@@ -196,13 +230,13 @@ func (s *Statement) joinRows(ec *evalCtx) ([]combo, error) {
 }
 
 // filterRows applies WHERE.
-func (s *Statement) filterRows(ec *evalCtx, combos []combo) ([]combo, error) {
-	if s.st.where == nil {
+func filterRows(ec *evalCtx, st *stmt, combos []combo) ([]combo, error) {
+	if st.where == nil {
 		return combos, nil
 	}
 	out := make([]combo, 0, len(combos))
 	for _, c := range combos {
-		v, err := ec.eval(s.st.where, c)
+		v, err := ec.eval(st.where, c)
 		if err != nil {
 			return nil, err
 		}
@@ -215,10 +249,10 @@ func (s *Statement) filterRows(ec *evalCtx, combos []combo) ([]combo, error) {
 
 // project evaluates the select list. The returned slice stays aligned with
 // combos so ORDER BY can evaluate expressions against the same rows.
-func (s *Statement) project(ec *evalCtx, combos []combo) ([][]any, error) {
+func project(ec *evalCtx, st *stmt, combos []combo) ([][]any, error) {
 	out := make([][]any, 0, len(combos))
 	for _, c := range combos {
-		row, err := s.projectRow(ec, c)
+		row, err := projectRow(ec, st, c)
 		if err != nil {
 			return nil, err
 		}
@@ -227,9 +261,9 @@ func (s *Statement) project(ec *evalCtx, combos []combo) ([][]any, error) {
 	return out, nil
 }
 
-func (s *Statement) projectRow(ec *evalCtx, c combo) ([]any, error) {
+func projectRow(ec *evalCtx, st *stmt, c combo) ([]any, error) {
 	var row []any
-	for _, item := range s.st.items {
+	for _, item := range st.items {
 		if !item.star {
 			v, err := ec.eval(item.e, c)
 			if err != nil {
@@ -273,22 +307,36 @@ func distinctRows(rows [][]any) [][]any {
 // to an output column by name first (pgjdbc sorts by quoted aliases like
 // "TABLE_SCHEM"), otherwise evaluates as an expression against the
 // underlying combination.
-func (s *Statement) sortRows(ec *evalCtx, combos []combo, proj [][]any) error {
-	if len(s.st.order) == 0 {
+func sortRows(ec *evalCtx, st *stmt, cols []Col, combos []combo, proj [][]any) error {
+	if len(st.order) == 0 {
 		return nil
 	}
 	keys := make([][]any, len(proj))
 	nameToIdx := map[string]int{}
-	for i, c := range s.cols {
+	for i, c := range cols {
 		nameToIdx[c.Name] = i
 	}
-	for t, term := range s.st.order {
+	for t, term := range st.order {
+		// positional reference first: ORDER BY 1 sorts by the first output
+		// column (psql's \d family leans on this)
+		if lit, ok := term.e.(literal); ok {
+			if n, isNum := lit.v.(float64); isNum && n == float64(int(n)) && int(n) >= 1 && int(n) <= len(cols) {
+				idx := int(n) - 1
+				for r := range proj {
+					if keys[r] == nil {
+						keys[r] = make([]any, len(st.order))
+					}
+					keys[r][t] = proj[r][idx]
+				}
+				continue
+			}
+		}
 		ref, isRef := term.e.(colRef)
 		if isRef && ref.tbl == "" {
 			if idx, ok := nameToIdx[ref.name]; ok {
 				for r := range proj {
 					if keys[r] == nil {
-						keys[r] = make([]any, len(s.st.order))
+						keys[r] = make([]any, len(st.order))
 					}
 					keys[r][t] = proj[r][idx]
 				}
@@ -297,7 +345,7 @@ func (s *Statement) sortRows(ec *evalCtx, combos []combo, proj [][]any) error {
 		}
 		for r := range proj {
 			if keys[r] == nil {
-				keys[r] = make([]any, len(s.st.order))
+				keys[r] = make([]any, len(st.order))
 			}
 			v, err := ec.eval(term.e, combos[r])
 			if err != nil {
@@ -313,7 +361,7 @@ func (s *Statement) sortRows(ec *evalCtx, combos []combo, proj [][]any) error {
 	}
 	sort.SliceStable(idx, func(a, b int) bool {
 		ia, ib := idx[a], idx[b]
-		for t, term := range s.st.order {
+		for t, term := range st.order {
 			c := compareValues(keys[ia][t], keys[ib][t])
 			if term.desc {
 				c = -c
@@ -470,8 +518,42 @@ func (ec *evalCtx) eval(e expr, c combo) (any, error) {
 			return nil, nil
 		}
 		return arr[n-1], nil
+	case subqueryExpr:
+		return ec.evalSubquery(x.st, c)
+	case arraySubqueryExpr:
+		rows, err := ec.evalSubqueryRows(x.st, c)
+		if err != nil {
+			return nil, err
+		}
+		arr := make([]any, 0, len(rows))
+		for _, r := range rows {
+			if len(r) > 0 {
+				arr = append(arr, r[0])
+			}
+		}
+		return arr, nil
 	}
 	return nil, errf(0, "cannot evaluate expression node %T", e)
+}
+
+// evalSubquery runs a scalar subquery against the enclosing row: the first
+// row's first output column, or NULL when the subquery answers nothing.
+// The subquery re-runs per outer row — catalog tables are small, and the
+// correlation (d.adrelid = a.attrelid in psql's describe queries) needs it.
+func (ec *evalCtx) evalSubquery(st *stmt, outer combo) (any, error) {
+	rows, err := ec.evalSubqueryRows(st, outer)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 || len(rows[0]) == 0 {
+		return nil, nil
+	}
+	return rows[0][0], nil
+}
+
+// evalSubqueryRows runs the subquery and returns all its rows.
+func (ec *evalCtx) evalSubqueryRows(st *stmt, outer combo) ([][]any, error) {
+	return runQuery(ec.snap.ctx, ec.snap, st, flattenFrom(st.from), ec, outer)
 }
 
 // evalFunction checks the whitelist, evaluates arguments eagerly and calls
@@ -519,12 +601,21 @@ func (ec *evalCtx) evalColumn(x colRef, c combo) (any, error) {
 			}
 		}
 		if matches == 0 {
+			// correlated reference: resolve against the enclosing row
+			if ec.parent != nil {
+				return ec.parent.eval(x, ec.outer)
+			}
 			return nil, &Error{Type: "42703", Reason: fmt.Sprintf("column %q does not exist", x.name)}
 		}
 		return hit, nil
 	}
 	src, ok := ec.byAlias[x.tbl]
 	if !ok {
+		// correlated reference through a qualified name: the alias belongs
+		// to the enclosing row
+		if ec.parent != nil {
+			return ec.parent.eval(x, ec.outer)
+		}
 		return nil, &Error{Type: "42P01", Reason: fmt.Sprintf("missing FROM-clause entry for table %q", x.tbl)}
 	}
 	bound := ec.sources[src]
@@ -581,6 +672,20 @@ func (ec *evalCtx) evalBinary(x binExpr, c combo) (any, error) {
 
 	switch x.op {
 	case "=", "<>", "<", ">", "<=", ">=":
+		if x.anyList {
+			arr, ok := r.([]any)
+			if !ok {
+				return false, nil
+			}
+			found := false
+			for _, e := range arr {
+				if compareValues(l, e) == 0 {
+					found = true
+					break
+				}
+			}
+			return found != x.not, nil
+		}
 		cmp := compareValues(l, r)
 		var res bool
 		switch x.op {

@@ -163,6 +163,48 @@ func validateFunctions(e expr) error {
 			return err
 		}
 		return validateFunctions(x.idx)
+	case subqueryExpr:
+		return validateSubquery(x.st)
+	case arraySubqueryExpr:
+		return validateSubquery(x.st)
+	}
+	return nil
+}
+
+// validateSubquery checks a scalar subquery the way Prepare checks the top
+// statement: catalog-table FROM, whitelisted functions, nested subqueries.
+func validateSubquery(st *stmt) error {
+	for _, src := range flattenFrom(st.from) {
+		if _, ok := tableRegistry[src.ref.name]; !ok {
+			return &Error{Type: "42P01", Reason: "relation \"" + src.ref.name + "\" does not exist"}
+		}
+		if src.on != nil {
+			if err := validateFunctions(src.on); err != nil {
+				return err
+			}
+		}
+	}
+	for _, item := range st.items {
+		if !item.star {
+			if err := validateFunctions(item.e); err != nil {
+				return err
+			}
+		}
+	}
+	if st.where != nil {
+		if err := validateFunctions(st.where); err != nil {
+			return err
+		}
+	}
+	for _, term := range st.order {
+		if err := validateFunctions(term.e); err != nil {
+			return err
+		}
+	}
+	for _, branch := range st.union {
+		if err := validateSubquery(branch.st); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -277,6 +319,8 @@ func inferOID(e expr, bound []boundDef) uint32 {
 			return OIDText
 		}
 	case subscriptExpr:
+		return OIDText
+	case subqueryExpr, arraySubqueryExpr:
 		return OIDText
 	case paramRef:
 		return OIDText

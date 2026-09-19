@@ -99,6 +99,7 @@ func init() {
 	// catalogs answer unconditionally
 	registerTrue("pg_table_is_visible", 1)
 	registerTrue("pg_type_is_visible", 1)
+	registerTrue("pg_database_is_visible", 1)
 	registerTrue("pg_function_is_visible", 1)
 	registerTrue("pg_operator_is_visible", 1)
 	registerTrue("pg_conversion_is_visible", 1)
@@ -116,7 +117,17 @@ func init() {
 	// definition decompilers: the underlying expressions (column defaults,
 	// index predicates, constraint checks) do not exist in lyrebird's model
 	registerNul("pg_get_expr", -1)
-	registerNul("pg_get_constraintdef", -1)
+	registerNul("pg_get_statisticsobjdef_columns", 1)
+	registerNul("pg_get_partkeydef", 1)
+	registerNul("pg_get_viewdef", -1)
+	registerNul("pg_get_triggerdef", -1)
+	register("pg_get_constraintdef", OIDText, -1, func(ec *evalCtx, args []any) (any, error) {
+		// the one constraint type the catalog reports is PRIMARY KEY;
+		// pg_get_constraintdef renders it from the pg_constraint row —
+		// answered as NULL here (psql shows an empty definition) — hmm,
+		// keep NULL honest: the constraint's parsed form isn't stored.
+		return nil, nil
+	})
 	registerNul("pg_get_indexdef", -1)
 	registerNul("pg_get_viewdef", -1)
 	registerNul("pg_get_functiondef", -1)
@@ -142,6 +153,51 @@ func init() {
 	register("quote_ident", OIDText, 1, quoteText)
 	register("quote_literal", OIDText, 1, quoteText)
 	register("quote_nullable", OIDText, 1, quoteText)
+	register("format", OIDText, -1, func(ec *evalCtx, args []any) (any, error) {
+		if len(args) == 0 || args[0] == nil {
+			return nil, nil
+		}
+		tpl, _ := toString(args[0])
+		rest := args[1:]
+		var b strings.Builder
+		i := 0
+		argIdx := 0
+		for i < len(tpl) {
+			c := tpl[i]
+			if c != '%' {
+				b.WriteByte(c)
+				i++
+				continue
+			}
+			i++
+			if i >= len(tpl) {
+				break
+			}
+			switch tpl[i] {
+			case 's':
+				if argIdx < len(rest) {
+					s, _ := toString(rest[argIdx])
+					b.WriteString(s)
+					argIdx++
+				}
+			case 'I', 'L':
+				// %I identifier / %L literal quoting: render plain — catalog
+				// format() calls only format display names
+				if argIdx < len(rest) {
+					s, _ := toString(rest[argIdx])
+					b.WriteString(s)
+					argIdx++
+				}
+			case '%':
+				b.WriteByte('%')
+			default:
+				b.WriteByte('%')
+				b.WriteByte(tpl[i])
+			}
+			i++
+		}
+		return b.String(), nil
+	})
 	register("lower", OIDText, 1, func(ec *evalCtx, args []any) (any, error) {
 		s, _ := toString(args[0])
 		return strings.ToLower(s), nil

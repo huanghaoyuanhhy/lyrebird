@@ -94,6 +94,11 @@ func (f *fakeExecutor) Collection(ctx context.Context, db, name string) (catalog
 	return meta, nil
 }
 
+// CollectionStats implements store.Cluster: the fake has no entities.
+func (f *fakeExecutor) CollectionStats(ctx context.Context, db, name string) (int64, error) {
+	return 0, nil
+}
+
 // dbSchemas picks the schema set a database name resolves to.
 func (f *fakeExecutor) dbSchemas(db string) (map[string]translate.Schema, bool) {
 	switch db {

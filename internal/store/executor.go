@@ -71,6 +71,11 @@ func (e *LogExecutor) Collection(ctx context.Context, db, name string) (catalog.
 	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", ErrCollectionNotFound, name)
 }
 
+// CollectionStats implements Cluster: the stand-in has no entities.
+func (e *LogExecutor) CollectionStats(ctx context.Context, db, name string) (int64, error) {
+	return 0, nil
+}
+
 // Schema implements Executor: the stand-in knows no fields, so every lookup
 // reads as unknown — the same answer as a real collection with no fields.
 func (e *LogExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {

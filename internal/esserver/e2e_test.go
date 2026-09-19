@@ -263,6 +263,83 @@ func TestEsserverFullStackE2E(t *testing.T) {
 			t.Errorf("cluster info = %v", res)
 		}
 	})
+
+	t.Run("catalog: mapping exposes the fixture fields", func(t *testing.T) {
+		res := roundtrip(t, srv, http.MethodGet, milvustest.Collection+"/_mapping", "", http.StatusOK)
+		index, ok := res[milvustest.Collection].(map[string]any)
+		if !ok {
+			t.Fatalf("mapping missing %q: %v", milvustest.Collection, res)
+		}
+		props := index["mappings"].(map[string]any)["properties"].(map[string]any)
+		for _, field := range []string{"id", "name", "price", "emb"} {
+			if _, ok := props[field]; !ok {
+				t.Errorf("mapping missing field %q: %v", field, props)
+			}
+		}
+		if props["price"].(map[string]any)["type"] != "double" {
+			t.Errorf("price type = %v, want double (the fixture's price is Milvus Double)", props["price"])
+		}
+		if props["emb"].(map[string]any)["type"] != "dense_vector" {
+			t.Errorf("emb type = %v, want dense_vector", props["emb"])
+		}
+	})
+
+	t.Run("catalog: _cat/indices lists every fixture collection", func(t *testing.T) {
+		raw := rawRoundtrip(t, srv, "/_cat/indices?format=json&h=index,docs.count")
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+			t.Fatalf("body: %s", raw)
+		}
+		var names []string
+		for _, row := range rows {
+			names = append(names, row["index"].(string))
+		}
+		joined := strings.Join(names, ",")
+		for _, want := range []string{milvustest.Collection, milvustest.TextCollection, milvustest.VectorCollection} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("indices missing %q: %v", want, names)
+			}
+		}
+		for _, row := range rows {
+			if row["index"] == milvustest.Collection && row["docs.count"] != "5" {
+				t.Errorf("docs.count = %v, want 5", row["docs.count"])
+			}
+		}
+	})
+
+	t.Run("catalog: cluster health and empty alias surfaces", func(t *testing.T) {
+		res := roundtrip(t, srv, http.MethodGet, "/_cluster/health", "", http.StatusOK)
+		if res["status"] != "green" {
+			t.Errorf("health = %v", res)
+		}
+		raw := rawRoundtrip(t, srv, "/_cat/aliases?format=json&h=alias,index")
+		if strings.TrimSpace(raw) != "[]" {
+			t.Errorf("aliases = %q, want []", raw)
+		}
+		raw = rawRoundtrip(t, srv, "/_data_stream")
+		if !strings.Contains(raw, "data_streams") {
+			t.Errorf("data streams = %q", raw)
+		}
+	})
+}
+
+// rawRoundtrip is roundtrip without envelope decoding, for the non-envelope
+// catalog surfaces.
+func rawRoundtrip(t *testing.T, srv *httptest.Server, path string) string {
+	t.Helper()
+	resp, err := http.Get(srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s: status %d, body %s", path, resp.StatusCode, raw)
+	}
+	return string(raw)
 }
 
 // roundtrip fires one request and decodes the envelope, asserting the status.

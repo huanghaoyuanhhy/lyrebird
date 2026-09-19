@@ -66,15 +66,28 @@ func (d *tableDef) colIndex(name string) int {
 // build time by the (+width) helper below.
 func row(values ...any) []any { return values }
 
+// snapshotMeta is one collection's described metadata with the synthetic
+// OID this snapshot assigned it.
+type snapshotMeta struct {
+	meta CollectionMeta
+	oid  uint64
+}
+
 // snapshot is one execution's catalog data: which tables the query touches,
 // their generated rows, and the execution's session context (database name,
-// bind parameters, SET overlays).
+// bind parameters, SET overlays). ctx rides along because correlated scalar
+// subqueries materialize tables mid-evaluation.
 type snapshot struct {
 	db       string
 	provider Provider
 	tables   map[string]*tableData
 	settings map[string]string // set_config overlays for this execution
 	params   []any
+	ctx      context.Context
+
+	metas     []snapshotMeta
+	metasDone bool
+	metasErr  error
 }
 
 type tableData struct {
@@ -82,18 +95,49 @@ type tableData struct {
 	rows [][]any
 }
 
-// table materializes one virtual table, once per execution.
+// table materializes one virtual table, once per execution. A nil build is
+// the empty-system-table convention: registered for FROM references, never
+// contributing rows.
 func (s *snapshot) table(ctx context.Context, def *tableDef) (*tableData, error) {
 	if td, ok := s.tables[def.name]; ok {
 		return td, nil
 	}
-	rows, err := def.build(ctx, s)
-	if err != nil {
-		return nil, err
+	var rows [][]any
+	if def.build != nil {
+		var err error
+		rows, err = def.build(ctx, s)
+		if err != nil {
+			return nil, err
+		}
 	}
 	td := &tableData{def: def, rows: rows}
 	s.tables[def.name] = td
 	return td, nil
+}
+
+// collectionMetas describes every collection of the current database once
+// per snapshot. The OID assignment is snapshot-local: two independent
+// ListCollections calls may order collections differently, and pg_class.
+// oid must match pg_attribute.attrelid within one answer.
+func (s *snapshot) collectionMetas(ctx context.Context) ([]snapshotMeta, error) {
+	if s.metasDone {
+		return s.metas, s.metasErr
+	}
+	s.metasDone = true
+	names, err := s.provider.ListCollections(ctx, s.db)
+	if err != nil {
+		s.metasErr = err
+		return nil, err
+	}
+	for i, name := range names {
+		coll, err := s.provider.Collection(ctx, s.db, name)
+		if err != nil {
+			s.metasErr = err
+			return nil, err
+		}
+		s.metas = append(s.metas, snapshotMeta{meta: coll, oid: firstTableOID + uint64(i)})
+	}
+	return s.metas, nil
 }
 
 // collectionRows is the shared generator behind pg_class, pg_attribute,
@@ -101,17 +145,13 @@ func (s *snapshot) table(ctx context.Context, def *tableDef) (*tableData, error)
 // database once and hands each CollectionMeta to the row-shaping callback,
 // which may contribute any number of rows (pg_attribute: one per field).
 func collectionRows(ctx context.Context, s *snapshot, shape func(coll CollectionMeta, tableOID uint64) ([][]any, error)) ([][]any, error) {
-	names, err := s.provider.ListCollections(ctx, s.db)
+	metas, err := s.collectionMetas(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows := make([][]any, 0, len(names))
-	for i, name := range names {
-		coll, err := s.provider.Collection(ctx, s.db, name)
-		if err != nil {
-			return nil, err
-		}
-		part, err := shape(coll, firstTableOID+uint64(i))
+	rows := make([][]any, 0, len(metas))
+	for _, m := range metas {
+		part, err := shape(m.meta, m.oid)
 		if err != nil {
 			return nil, err
 		}
@@ -131,6 +171,8 @@ var catalogTables = []tableDef{
 			col("encoding", OIDInt4), col("datistemplate", OIDBool),
 			col("datallowconn", OIDBool), col("datconnlimit", OIDInt4),
 			col("dattablespace", OIDOID), col("datcollate", OIDText), col("datctype", OIDText),
+			col("datlocprovider", OIDChar), col("datlocale", OIDText),
+			col("daticulocale", OIDText), col("daticurules", OIDText), col("datacl", OIDTextArray),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
 			dbs, err := s.provider.Databases(ctx)
@@ -141,7 +183,8 @@ var catalogTables = []tableDef{
 			for i, name := range dbs {
 				rows = append(rows, row(
 					float64(firstTableOID+uint64(i)), name, float64(ownerOID),
-					float64(6), false, true, float64(-1), float64(1663), "C", "C"))
+					float64(6), false, true, float64(-1), float64(1663), "C", "C",
+					"c", nil, nil, nil, nil))
 			}
 			return rows, nil
 		},
@@ -174,6 +217,7 @@ var catalogTables = []tableDef{
 			col("reltablespace", OIDOID), col("relpages", OIDInt4), col("reltuples", OIDFloat4),
 			col("relhasindex", OIDBool), col("relhasrules", OIDBool), col("relhastriggers", OIDBool),
 			col("relpersistence", OIDChar), col("relnatts", OIDInt2), col("relrowsecurity", OIDBool),
+			col("relchecks", OIDInt2), col("reloftype", OIDOID),
 			col("relforcerowsecurity", OIDBool), col("relispartition", OIDBool),
 			col("relispopulated", OIDBool), col("relreplident", OIDChar), col("reltoastrelid", OIDOID),
 			col("relacl", OIDText),
@@ -186,7 +230,7 @@ var catalogTables = []tableDef{
 				float64(0), float64(0), float64(0),
 				false, false, false,
 				"p", float64(len(coll.Fields)), false,
-				false, false,
+				float64(0), float64(0), false, false,
 				true, "d", float64(0),
 				nil,
 			}}, nil
@@ -202,7 +246,7 @@ var catalogTables = []tableDef{
 			col("attinhcount", OIDInt4), col("attidentity", OIDChar), col("attgenerated", OIDChar),
 			col("attbyval", OIDBool), col("attalign", OIDChar), col("attstorage", OIDChar),
 			col("attstattarget", OIDInt4), col("attndims", OIDInt2), col("attcacheoff", OIDInt4),
-			col("attacl", OIDText),
+			col("attacl", OIDText), col("attcollation", OIDOID),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
 			return collectionRows(ctx, s, func(coll CollectionMeta, tableOID uint64) ([][]any, error) {
@@ -216,7 +260,7 @@ var catalogTables = []tableDef{
 						float64(0), "", "",
 						typByVal(oid), typAlign(oid), typStorage(oid),
 						float64(-1), float64(0), float64(-1),
-						nil))
+						nil, float64(collationDefaultOID)))
 				}
 				return rows, nil
 			})
@@ -295,6 +339,7 @@ var catalogTables = []tableDef{
 			col("typisdefined", OIDBool), col("typdelim", OIDChar), col("typrelid", OIDOID),
 			col("typelem", OIDOID), col("typarray", OIDOID), col("typalign", OIDChar),
 			col("typstorage", OIDChar), col("typcategory", OIDChar), col("typdefault", OIDText),
+			col("typcollation", OIDOID),
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
 			rows := make([][]any, 0, len(sysTypes))
@@ -304,7 +349,8 @@ var catalogTables = []tableDef{
 					float64(ownerOID), t.typlen, t.typtype,
 					true, ",", float64(0),
 					float64(0), float64(t.arrayOf), "i",
-					"p", t.category, nil))
+					"p", t.category, nil,
+					float64(0)))
 			}
 			return rows, nil
 		},
@@ -610,6 +656,69 @@ var pgSettingsDef = tableDef{
 	},
 }
 
+// collationDefaultOID is the synthetic OID of the one collation row.
+const collationDefaultOID = 100
+
+var pgCollationDef = tableDef{
+	name: "pg_collation",
+	cols: []colDef{
+		col("oid", OIDOID), col("collname", OIDName), col("collnamespace", OIDOID),
+		col("collprovider", OIDChar), col("collisdeterministic", OIDBool),
+	},
+	build: func(ctx context.Context, s *snapshot) ([][]any, error) {
+		return [][]any{{
+			float64(collationDefaultOID), "default", float64(11),
+			"d", true,
+		}}, nil
+	},
+}
+
+// emptySystemTables are the catalog tables lyrebird exposes as always
+// empty: the objects they describe (triggers, rules, inheritance, extended
+// statistics, publications, foreign tables) do not exist in the gateway's
+// model, but psql's \d family joins them on every describe.
+var emptySystemTables = []tableDef{
+	{name: "pg_trigger", cols: []colDef{col("oid", OIDOID), col("tgname", OIDName), col("tgrelid", OIDOID), col("tgfoid", OIDOID), col("tgtype", OIDInt2), col("tgenabled", OIDChar), col("tgparentid", OIDOID), col("tgattr", OIDInt2Array), col("tgargs", OIDBytea), col("tgqual", OIDText), col("tgisinternal", OIDBool)}},
+	{name: "pg_rewrite", cols: []colDef{col("oid", OIDOID), col("rulename", OIDName), col("ev_class", OIDOID), col("ev_type", OIDChar), col("ev_enabled", OIDChar), col("is_instead", OIDBool), col("ev_action", OIDText)}},
+	{name: "pg_inherits", cols: []colDef{col("inhrelid", OIDOID), col("inhparent", OIDOID), col("inhseqno", OIDInt4), col("inhdetachpending", OIDBool)}},
+	{name: "pg_partitioned_table", cols: []colDef{col("partrelid", OIDOID), col("partstrat", OIDChar), col("partnatts", OIDInt2), col("partdefid", OIDOID), col("partattrs", OIDInt2Array), col("partclass", OIDOIDArray)}},
+	{name: "pg_depend", cols: []colDef{col("classid", OIDOID), col("objid", OIDOID), col("objsubid", OIDInt4), col("refclassid", OIDOID), col("refobjid", OIDOID), col("refobjsubid", OIDInt4), col("deptype", OIDChar)}},
+	{name: "pg_statistic_ext", cols: []colDef{col("oid", OIDOID), col("stxrelid", OIDOID), col("stxname", OIDName), col("stxnamespace", OIDOID), col("stxowner", OIDOID), col("stxstattarget", OIDInt4), col("stxkeys", OIDInt2Array), col("stxkind", OIDTextArray)}},
+	{name: "pg_publication", cols: []colDef{col("oid", OIDOID), col("pubname", OIDName), col("pubowner", OIDOID), col("puballtables", OIDBool), col("pubinsert", OIDBool), col("pubupdate", OIDBool), col("pubdelete", OIDBool), col("pubtruncate", OIDBool), col("pubviaroot", OIDBool)}},
+	{name: "pg_publication_rel", cols: []colDef{col("oid", OIDOID), col("prpubid", OIDOID), col("prrelid", OIDOID), col("prqual", OIDText), col("prattrs", OIDInt2Array)}},
+	{name: "pg_publication_namespace", cols: []colDef{col("oid", OIDOID), col("pnpubid", OIDOID), col("pnnspid", OIDOID)}},
+	{name: "pg_foreign_table", cols: []colDef{col("ftrelid", OIDOID), col("ftserver", OIDOID), col("ftoptions", OIDTextArray)}},
+	{name: "pg_foreign_server", cols: []colDef{col("oid", OIDOID), col("srvname", OIDName), col("srvowner", OIDOID), col("srvfdw", OIDOID), col("srvoptions", OIDTextArray)}},
+	{name: "pg_foreign_data_wrapper", cols: []colDef{col("oid", OIDOID), col("fdwname", OIDName), col("fdwowner", OIDOID), col("fdwoptions", OIDTextArray)}},
+	{name: "pg_user_mapping", cols: []colDef{col("oid", OIDOID), col("umuser", OIDOID), col("umdb", OIDOID), col("umoptions", OIDTextArray)}},
+	{name: "pg_extension", cols: []colDef{col("oid", OIDOID), col("extname", OIDName), col("extnamespace", OIDOID), col("extowner", OIDOID), col("extversion", OIDText)}},
+	{name: "pg_event_trigger", cols: []colDef{col("oid", OIDOID), col("evtname", OIDName), col("evtevent", OIDName), col("evtowner", OIDOID), col("evtenabled", OIDChar)}},
+	{name: "pg_subscription", cols: []colDef{col("oid", OIDOID), col("subname", OIDName), col("subowner", OIDOID), col("subenabled", OIDBool), col("subconninfo", OIDText)}},
+	{name: "pg_shdepend", cols: []colDef{col("dbid", OIDOID), col("classid", OIDOID), col("objid", OIDOID), col("refclassid", OIDOID), col("refobjid", OIDOID), col("deptype", OIDChar)}},
+	{name: "pg_seclabel", cols: []colDef{col("objoid", OIDOID), col("classoid", OIDOID), col("objsubid", OIDInt4), col("provider", OIDText), col("label", OIDText)}},
+}
+
+func init() {
+	for i := range emptySystemTables {
+		d := &emptySystemTables[i]
+		tableRegistry[d.name] = d
+	}
+}
+
+var pgPolicyDef = tableDef{
+	name: "pg_policy",
+	cols: []colDef{
+		col("oid", OIDOID), col("polname", OIDName), col("polrelid", OIDOID),
+		col("polcmd", OIDChar), col("polpermissive", OIDBool),
+		col("polroles", OIDOIDArray), col("polqual", OIDText), col("polwithcheck", OIDText),
+	},
+	build: func(ctx context.Context, s *snapshot) ([][]any, error) {
+		return nil, nil // no row-level security policies
+	},
+}
+
 func init() {
 	tableRegistry[pgSettingsDef.name] = &pgSettingsDef
+	tableRegistry[pgCollationDef.name] = &pgCollationDef
+	tableRegistry[pgPolicyDef.name] = &pgPolicyDef
 }

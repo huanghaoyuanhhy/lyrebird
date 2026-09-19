@@ -39,7 +39,8 @@ var keywords = map[string]bool{
 	"CASE": true, "WHEN": true, "THEN": true, "ELSE": true, "END": true,
 	"JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true, "FULL": true,
 	"OUTER": true, "CROSS": true, "ON": true, "USING": true, "FOR": true,
-	"CAST": true, "EXISTS": true,
+	"CAST": true, "EXISTS": true, "COLLATE": true,
+	"ANY": true, "SOME": true, "ALL": true,
 }
 
 // operators lists the operator/punctuation tokens longest first, so "!~"
@@ -87,6 +88,18 @@ func lex(src string) ([]token, error) {
 			toks = append(toks, token{kind: tkNumber, text: src[i : i+n], pos: i})
 			i += n
 		case isIdentStart(c):
+			// E'…' escape-string constants: the E is part of the literal,
+			// not an identifier (standard_conforming_strings makes E'' the
+			// only escape form, and psql's \d family sends E'\n' separators)
+			if (c == 'E' || c == 'e') && i+1 < len(src) && src[i+1] == '\'' {
+				text, n, err := lexEscapeString(src, i)
+				if err != nil {
+					return nil, err
+				}
+				toks = append(toks, token{kind: tkString, text: text, pos: i})
+				i += n
+				break
+			}
 			j := i
 			for j < len(src) && isIdentPart(src[j]) {
 				j++
@@ -166,6 +179,54 @@ func lexQuoted(src string, start int, quote byte) (text string, n int, err error
 		}
 		b.WriteByte(src[i])
 		i++
+	}
+}
+
+// lexEscapeString reads an E'…' literal starting at the E, decoding the
+// C-style backslash escapes PostgreSQL accepts there.
+func lexEscapeString(src string, start int) (text string, n int, err error) {
+	var b strings.Builder
+	i := start + 2 // past E and the opening quote
+	for {
+		if i >= len(src) {
+			return "", 0, errf(start, "unterminated E-quoted literal")
+		}
+		c := src[i]
+		switch {
+		case c == '\'':
+			if i+1 < len(src) && src[i+1] == '\'' {
+				b.WriteByte('\'')
+				i += 2
+				continue
+			}
+			return b.String(), i + 1 - start, nil
+		case c == '\\':
+			if i+1 >= len(src) {
+				return "", 0, errf(start, "unterminated E-quoted literal")
+			}
+			switch src[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case 'b':
+				b.WriteByte('\b')
+			case 'f':
+				b.WriteByte('\f')
+			case '\\', '\'', '"':
+				b.WriteByte(src[i+1])
+			default:
+				// unknown escape: keep the character as-is, like PG's
+				// standard_conforming_strings warning path
+				b.WriteByte(src[i+1])
+			}
+			i += 2
+		default:
+			b.WriteByte(c)
+			i++
+		}
 	}
 }
 

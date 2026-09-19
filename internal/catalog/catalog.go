@@ -38,6 +38,11 @@ type FieldMeta struct {
 	// MaxLength is a VarChar field's max_length type param; 0 when unset.
 	// It drives pg_attribute's atttypmod (format_type renders varchar(n)).
 	MaxLength int
+	// Native is the backing store's own type name (Milvus "Int64", "Float",
+	// …), so protocol layers that name finer types than translate's
+	// vocabulary can (the ES mapping's long vs double) without a second
+	// provider call.
+	Native string
 }
 
 // CollectionMeta is one collection's catalog view: the name plus its fields

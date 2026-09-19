@@ -50,6 +50,8 @@ for PG); the store executes plan + collection against Milvus.
 cmd/gateway              entry point: start listener(s)
 internal/pgserver        PG wire protocol server (Phase 2)
 internal/esserver        ES-compatible REST server (Phase 1)
+internal/catalog         pg_catalog / information_schema projection + its
+                         query engine (Phase 3a)
 internal/translate
     ├─ pg/               SQL → Select (IR) → fold → Plan
     └─ es/               ES Query DSL → queryNode (IR) → fold → Plan
@@ -85,8 +87,28 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
   - [x] pgvector distance search: `ORDER BY emb <=> '[0.1, …]' LIMIT n` runs
     the Milvus ANN path (`<->` L2, `<=>` cosine, `<#>` inner product; the
     metric must agree with the field's index), scalar WHERE filters ride along
-- [ ] **Phase 3** Schema catalog: config-driven mapping + describe-based discovery;
-  DDL (CREATE TABLE → CreateCollection)
+- [x] **Phase 3a** Catalog introspection: GUI clients (DataGrip, psql's `\d`
+  family) browse the cluster through a live pg_catalog / information_schema
+  projection
+  - [x] `internal/catalog`: virtual catalog tables generated from a
+    Provider (Milvus database → PG database, collection → table, field →
+    column) plus a small dedicated engine for the query shapes catalog
+    clients use — joins, CASE, LIKE/regex filters, ORDER BY over output
+    aliases, bind parameters, a scalar-function whitelist; pgjdbc shapes
+    that outgrow it (derived tables, `row_number() OVER`,
+    `_pg_expandarray`, …) run as named special cases pinned by real-SQL
+    fixtures from PgDatabaseMetaData.java
+  - [x] `internal/pgserver` dispatches per statement: session acks
+    (SET/SHOW/RESET/DISCARD/BEGIN/COMMIT/ROLLBACK), catalog SELECTs,
+    collection reads (unchanged pipeline); the startup database selects the
+    Milvus database ("postgres" aliases onto the configured default)
+  - [x] `internal/esserver` catalog surface: `_cat/indices`,
+    `_cat/aliases`, `_data_stream`, `/{index}/_mapping`,
+    `_cluster/health` — the probe set the DataGrip ES REST plugin makes on
+    connect
+- [ ] **Phase 3b** Schema catalog config: external-name mapping (config-first
+  + describe validation, design.md decision 6); DDL (CREATE TABLE →
+  CreateCollection)
 - [ ] **Phase 4** Write path: insert/update/delete → upsert/delete
 - [ ] **Phase 5** Full-text alignment: ES match → Milvus BM25, score semantics aligned
 
@@ -124,3 +146,29 @@ The e2e suites skip unless configured, so credentials stay out of the repo:
 standalone, Elasticsearch 8.x, Postgres+pgvector), seeds the same fixtures
 into each, and runs everything; the `E2E` GitHub Actions workflow runs the
 same thing on every push and pull request.
+
+## Connecting GUI tools
+
+The gateway reads your Milvus cluster's live metadata, so any catalog-aware
+client sees database → table → column without extra setup:
+
+- **DataGrip (PostgreSQL source)**: connect to `jdbc:postgresql://host:5433/postgres`
+  (any username/password). The tree shows one database per Milvus database —
+  use the database name from the catalog list to browse another one. If
+  introspection stalls, set the data source's introspection level to
+  **JDBC metadata** (right-click the schema → Introspection Level); the
+  Queried/Raw levels send wider pg_catalog queries and are covered on a
+  best-effort basis.
+- **DataGrip (Elasticsearch)**: install the *ES REST Data Source* plugin,
+  connect to `jdbc:es-rest://host:9200`. Indices browse as tables; queries
+  run through `/{index}/_search`.
+- **psql**: `psql 'postgres://user@host:5433/postgres'` — `\l` lists the
+  Milvus databases, `\dt` the collections, and data queries run as usual.
+  The per-column describe (`\d table`, `\d+ table`) walks psql's own
+  version-specific PRM SQL and is covered best-effort: it works when the
+  engine parses psql's query shapes, and fails with a clean 42601/42883
+  where it does not (no silent wrong answers).
+
+Types follow the pg-wire contract (docs/design.md): every number reads as
+`float8`, strings as `text`, JSON/array/vector fields as `json`.
+

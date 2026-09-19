@@ -248,6 +248,92 @@ envelope assembly is untouched.
   Total=topk), so the number is honest about what came back, not about the
   collection. The query-level `knn` (inside `query`) stays rejected.
 
+## Settled — catalog introspection surface (2026-09-19)
+
+Goal: DataGrip and friends browse the cluster (database → table → column)
+over both protocols. Evidence chain: pgjdbc's PgDatabaseMetaData.java and
+the DataGrip ES REST plugin's source were read for the exact query set
+before any design; the fixtures in internal/catalog/pgjdbc_test.go are
+those queries' real text.
+
+- **Shape**: new `internal/catalog` — virtual pg_catalog /
+  information_schema tables projected live from a Provider
+  (ListCollections / Collection / Databases; no cache: one metadata query
+  costs one roundtrip, catalog queries are rare). Milvus database → PG
+  database (user decision 2026-09-19: not a single-db alias tree);
+  collection → table (relkind 'r', one synthetic OID from 16384); field →
+  column. One schema per database: `public` (+ the pg_catalog /
+  information_schema / pg_toast rows real PG has — getMaxNameLength joins
+  on nspname='pg_catalog').
+- **Engine**: a dedicated small evaluator, not the translate/pg pipeline.
+  Catalog clients need joins, CASE, LIKE/regex, ORDER BY over quoted
+  output aliases, bind parameters and a function whitelist — none of which
+  the data path's SELECT subset wants. The engine parses only
+  FROM-catalog-table statements; pgserver routes by registry lookup, so a
+  collection query can never land here (and catalog queries keep their own
+  SQLSTATEs: 42601/42703/42883/42P01). No mandatory LIMIT here — catalog
+  row sets are the cluster's own metadata.
+- **Named special cases**: shapes beyond the engine (derived tables,
+  `row_number() OVER`, `information_schema._pg_expandarray`,
+  generate_series, correlated subqueries) are per-method generators keyed
+  on verbatim SQL landmarks from PgDatabaseMetaData.java — getColumns,
+  getPrimaryKeys (the pg_constraint path), getPrimaryUniqueKeys,
+  getBestRowIdentifier, getImportedExportedKeys (always empty: no FKs),
+  getTypeInfo, getUDTs (empty), getIndexInfo, getFunctionColumns (empty).
+  Their `?` parameters are located by the filter each feeds — pgjdbc sends
+  JDBC markers that arrive as `$n` after client-side substitution — with
+  case-insensitive aliases because the outer queries select through
+  derived-table aliases (TABLE_NAME vs relname).
+- **Session surface**: SET / RESET / DISCARD ack (values accepted, not
+  applied — there is no session state to change), BEGIN/COMMIT/ROLLBACK
+  ack (no transaction state; pgjdbc opens them under autocommit=off),
+  SHOW from the same settings table pg_settings projects (incl. PG's
+  two-word forms: `SHOW TIME ZONE`), scalar SELECTs (version(),
+  current_database(), set_config('search_path',…), SELECT 1) answered by
+  the engine's FROM-less path.
+- **Per-connection database**: the startup `database` parameter names the
+  Milvus database; `""` and `postgres` alias onto --milvus-db (every PG
+  client's URL default is postgres). One pooled milvus client per database
+  — SDK UseDatabase mutates the shared client, so per-call switching would
+  race across connections. Catalog data AND collection reads follow the
+  connection's database.
+- **Type naming**: catalog type names/OIDs and RowDescription share one
+  table (catalog.FieldTypeOID): numbers float8, strings text, JSON/array/
+  vector json — the settled pg-wire decision, so a column never describes
+  itself as one type and delivers another. int8/timestamp refinement
+  would re-type the wire too — left as a later decision. FieldMeta carries
+  the native Milvus type name so the ES mapping can say long vs float.
+- **ES surface** (the plugin's five probes): `_cat/indices`
+  (+`/{index}`, format=json/text, h= subset; docs.count from
+  GetCollectionStats, -1 on failure like ES's unknown marker),
+  `_cat/aliases` (empty), `_data_stream` (empty), `/{index}/_mapping`
+  (batched comma lists skip missing names; a single unknown name is a
+  native 404 index_not_found_exception; dense_vector carries dim; the
+  mapping type comes from the native Milvus type — long/float/double/
+  boolean/keyword/text/dense_vector/object), `_cluster/health` (+`/{index}`).
+- **DataGrip caveat**: the JDBC metadata introspection level is the pinned
+  target (public query set). DataGrip's Queried/Raw levels send its own
+  PRM queries — broader, undocumented, versioned — and are best-effort:
+  new shapes land as engine additions or named cases after capture.
+  Switching levels is a per-schema right-click.
+- **psql boundary**: `\l` and `\dt` are covered end-to-end (verified
+  against psql 16's real query sequence), which forced the engine's last
+  round of features: multi-statement splitting (psql sends its describe
+  family as one string; psql-wire does not split), `E''` escape strings,
+  ORDER BY output position, `COLLATE` no-ops, `OPERATOR(pg_catalog.~)`,
+  `= ANY(…)`, `ARRAY(SELECT …)`, scalar correlated subqueries with a
+  parent-context fallback, UNION branches, and the always-empty system
+  tables psql joins (pg_policy, pg_trigger, pg_statistic_ext, pg_collation,
+  …). Per-column describe (`\d`/`\d+`) additionally needs correlated
+  table-functions (FROM generate_series/unnest) plus aggregates
+  (string_agg) — not built; those statements fail with the engine's own
+  syntax error rather than a wrong answer. DataGrip never sends them.
+- **Not done here**: aliases (ES), schemas beyond public, description
+  columns (all null), privilege emulation (has_*_privilege always true),
+  multi-statement batches (psql-wire does not split). Decision 6 (external
+  name → collection mapping config) stays open — Phase 3b territory, this
+  work is pure describe-based discovery.
+
 ## Settled — IR placement: query-level IR stays frontend-private (2026-09-13)
 
 - Layering, top to bottom: **query-level IR is per-frontend** (es: the hand-rolled

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -288,6 +289,101 @@ func TestPgserverFullStackE2E(t *testing.T) {
 		if count != 5 {
 			t.Errorf("rows = %d, want 5", count)
 		}
+	})
+
+	t.Run("catalog introspection over the real cluster", func(t *testing.T) {
+		dsn := fmt.Sprintf("postgres://lyrebird:lyrebird@%s/postgres?sslmode=disable", ln.Addr())
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(context.Background())
+
+		t.Run("getTables shows every fixture collection", func(t *testing.T) {
+			rows, err := conn.Query(ctx,
+				`SELECT c.relname, n.nspname FROM pg_catalog.pg_class c `+
+					`LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace `+
+					`WHERE c.relnamespace = n.oid AND c.relkind = 'r' AND n.nspname !~ '^pg_' `+
+					`ORDER BY c.relname LIMIT 100`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var names []string
+			for rows.Next() {
+				var relname, nspname string
+				if err := rows.Scan(&relname, &nspname); err != nil {
+					t.Fatal(err)
+				}
+				if nspname != "public" {
+					t.Errorf("schema = %q, want public", nspname)
+				}
+				names = append(names, relname)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			rows.Close()
+			joined := strings.Join(names, ",")
+			for _, want := range []string{milvustest.Collection, milvustest.TextCollection, milvustest.VectorCollection} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("tables missing %q: %v", want, names)
+				}
+			}
+		})
+
+		t.Run("getColumns orders the fixture fields", func(t *testing.T) {
+			rows, err := conn.Query(ctx,
+				`SELECT a.attname, a.attnum FROM pg_catalog.pg_attribute a `+
+					`JOIN pg_catalog.pg_class c ON (a.attrelid = c.oid) `+
+					`WHERE c.relname = $1 AND a.attnum > 0 ORDER BY a.attnum LIMIT 20`, milvustest.Collection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var fields []string
+			for rows.Next() {
+				var name string
+				var attnum int32
+				if err := rows.Scan(&name, &attnum); err != nil {
+					t.Fatal(err)
+				}
+				if attnum != int32(len(fields)+1) {
+					t.Errorf("attnum %d out of order at position %d", attnum, len(fields)+1)
+				}
+				fields = append(fields, name)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			rows.Close()
+			want := []string{"id", "name", "price", "qty", "active", "created_ms", "note", "emb"}
+			if strings.Join(fields, ",") != strings.Join(want, ",") {
+				t.Errorf("fields = %v, want %v", fields, want)
+			}
+		})
+
+		t.Run("session surface keeps psql alive", func(t *testing.T) {
+			for _, stmt := range []string{
+				"SET extra_float_digits = 3",
+				"BEGIN", "COMMIT",
+				"SELECT 1",
+				"SELECT version()",
+				"SELECT current_database()",
+				"SELECT pg_catalog.set_config('search_path', '', false)",
+			} {
+				tag, err := conn.Exec(ctx, stmt)
+				if err != nil {
+					t.Errorf("%q: %v", stmt, err)
+					continue
+				}
+				_ = tag
+			}
+			var setting string
+			if err := conn.QueryRow(ctx, "SHOW search_path").Scan(&setting); err != nil {
+				t.Errorf("SHOW search_path: %v", err)
+			}
+		})
 	})
 }
 

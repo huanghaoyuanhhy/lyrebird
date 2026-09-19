@@ -64,9 +64,9 @@ func testProvider() *fakeProvider {
 	}
 }
 
-// runQuery prepares and executes against the test provider, returning cell
+// execQuery prepares and executes against the test provider, returning cell
 // values raw for comparison.
-func runQuery(t *testing.T, sql string, params ...any) [][]any {
+func execQuery(t *testing.T, sql string, params ...any) [][]any {
 	t.Helper()
 	st, err := Prepare(sql)
 	if err != nil {
@@ -92,7 +92,7 @@ func TestScalarSelects(t *testing.T) {
 		{"SELECT pg_catalog.set_config('search_path', '', false)", ""},
 	}
 	for _, tc := range cases {
-		rows := runQuery(t, tc.sql)
+		rows := execQuery(t, tc.sql)
 		if len(rows) != 1 {
 			t.Fatalf("%q: %d rows, want 1", tc.sql, len(rows))
 		}
@@ -107,7 +107,7 @@ func TestScalarSelects(t *testing.T) {
 }
 
 func TestPgDatabase(t *testing.T) {
-	rows := runQuery(t, "SELECT datname FROM pg_database WHERE datallowconn = true ORDER BY datname")
+	rows := execQuery(t, "SELECT datname FROM pg_database WHERE datallowconn = true ORDER BY datname")
 	var got []string
 	for _, r := range rows {
 		s, _ := toString(r[0])
@@ -120,7 +120,7 @@ func TestPgDatabase(t *testing.T) {
 
 func TestPgSettingsMaxIndexKeys(t *testing.T) {
 	// pgjdbc getMaxIndexKeys: exactly this shape
-	rows := runQuery(t, "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'")
+	rows := execQuery(t, "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'")
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
@@ -131,7 +131,7 @@ func TestPgSettingsMaxIndexKeys(t *testing.T) {
 
 func TestCurrentSchemasSubscript(t *testing.T) {
 	// pgjdbc getSchemas compares pg_temp names against current_schemas(true)[1]
-	rows := runQuery(t, "SELECT current_schemas(true)[1]")
+	rows := execQuery(t, "SELECT current_schemas(true)[1]")
 	if s, _ := toString(rows[0][0]); s != "pg_catalog" {
 		t.Errorf("current_schemas(true)[1] = %q", rows[0][0])
 	}
@@ -143,7 +143,7 @@ func TestPgNamespaceFiltered(t *testing.T) {
 		`WHERE nspname <> 'pg_toast' AND (nspname !~ '^pg_temp_' OR nspname = current_schemas(true)[1]) ` +
 		`AND nspname <> 'pg_toast_temp_1' AND (nspname !~ '^pg_toast_temp_' OR nspname = current_schemas(true)[1]) ` +
 		`ORDER BY "TABLE_SCHEM"`
-	rows := runQuery(t, sql)
+	rows := execQuery(t, sql)
 	// real PG answers this with information_schema, pg_catalog and public —
 	// the pg_toast/pg_temp filters keep everything else out
 	var got []string
@@ -162,7 +162,7 @@ func TestPgClassJoinNamespace(t *testing.T) {
 		`LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace ` +
 		`WHERE c.relnamespace = n.oid AND c.relkind = 'r' AND n.nspname !~ '^pg_' ` +
 		`AND c.relname LIKE $1 ORDER BY c.relname`
-	rows := runQuery(t, sql, "%o%")
+	rows := execQuery(t, sql, "%o%")
 	var got []string
 	for _, r := range rows {
 		s, _ := toString(r[0])
@@ -174,7 +174,7 @@ func TestPgClassJoinNamespace(t *testing.T) {
 }
 
 func TestPgAttributeRows(t *testing.T) {
-	rows := runQuery(t, `SELECT a.attname, a.attnum FROM pg_attribute a WHERE a.attname = 'price'`)
+	rows := execQuery(t, `SELECT a.attname, a.attnum FROM pg_attribute a WHERE a.attname = 'price'`)
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
@@ -186,11 +186,11 @@ func TestPgAttributeRows(t *testing.T) {
 func TestFormatType(t *testing.T) {
 	// all string fields ride the text OID (the settled pg-wire decision), so
 	// format_type answers "text" for them; numbers answer float8
-	rows := runQuery(t, "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attname = 'name'")
+	rows := execQuery(t, "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attname = 'name'")
 	if s, _ := toString(rows[0][0]); s != "text" {
 		t.Errorf("format_type(keyword) = %q, want text", rows[0][0])
 	}
-	rows = runQuery(t, "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attname = 'price'")
+	rows = execQuery(t, "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attname = 'price'")
 	if s, _ := toString(rows[0][0]); s != "float8" {
 		t.Errorf("format_type(float8) = %q", rows[0][0])
 	}
@@ -200,7 +200,7 @@ func TestCaseRelkindMapping(t *testing.T) {
 	// the pgjdbc getTables TABLE_TYPE CASE, exercised over the real columns
 	sql := `SELECT CASE WHEN c.relkind = 'r' THEN 'TABLE' WHEN c.relkind = 'v' THEN 'VIEW' ELSE 'OTHER' END ` +
 		`FROM pg_class c ORDER BY 1`
-	rows := runQuery(t, sql)
+	rows := execQuery(t, sql)
 	if len(rows) != 2 {
 		t.Fatalf("rows = %d, want 2 collections", len(rows))
 	}
@@ -210,7 +210,7 @@ func TestCaseRelkindMapping(t *testing.T) {
 }
 
 func TestOrderByOutputAliasAndLimitOffset(t *testing.T) {
-	rows := runQuery(t, "SELECT relname AS n FROM pg_class ORDER BY n DESC LIMIT 1 OFFSET 1")
+	rows := execQuery(t, "SELECT relname AS n FROM pg_class ORDER BY n DESC LIMIT 1 OFFSET 1")
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
@@ -220,7 +220,7 @@ func TestOrderByOutputAliasAndLimitOffset(t *testing.T) {
 }
 
 func TestDistinct(t *testing.T) {
-	rows := runQuery(t, "SELECT DISTINCT relkind FROM pg_class")
+	rows := execQuery(t, "SELECT DISTINCT relkind FROM pg_class")
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1 (all relkind 'r')", len(rows))
 	}
@@ -254,7 +254,7 @@ func TestNonWhitelistedFunctionFails(t *testing.T) {
 }
 
 func TestParamRefs(t *testing.T) {
-	rows := runQuery(t, "SELECT relname FROM pg_class WHERE relname = $1", "items")
+	rows := execQuery(t, "SELECT relname FROM pg_class WHERE relname = $1", "items")
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
@@ -282,11 +282,11 @@ func TestDatabaseViewIsolation(t *testing.T) {
 }
 
 func TestInformationSchema(t *testing.T) {
-	rows := runQuery(t, `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name`)
+	rows := execQuery(t, `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name`)
 	if len(rows) != 2 {
 		t.Fatalf("rows = %d, want 2", len(rows))
 	}
-	rows = runQuery(t, `SELECT column_name, data_type FROM information_schema.columns `+
+	rows = execQuery(t, `SELECT column_name, data_type FROM information_schema.columns `+
 		`WHERE table_name = 'items' ORDER BY ordinal_position`)
 	if len(rows) != 4 {
 		t.Fatalf("columns = %d rows, want 4", len(rows))
