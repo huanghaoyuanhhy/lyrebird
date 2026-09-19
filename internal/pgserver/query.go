@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jeroenrinzema/psql-wire"
 	"github.com/jeroenrinzema/psql-wire/codes"
 	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
 	"go.uber.org/zap"
 
+	"github.com/huanghaoyuanhhy/lyrebird/internal/catalog"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate/pg"
 )
@@ -34,25 +35,19 @@ func resultColumns(sel *pg.Select, schema translate.Schema) (wire.Columns, []tra
 }
 
 // typeOID maps a field's translate type onto the PostgreSQL type OID the
-// wire describes cells with. Numbers render as float8 (the one numeric
-// vocabulary that covers Int and Float fields alike), the text family as
-// text, and unknown fields (JSON, arrays, vectors) as json.
+// wire describes cells with. The table lives in the catalog package so the
+// catalog's pg_attribute rows and these RowDescriptions agree by
+// construction: numbers render as float8 (the one numeric vocabulary that
+// covers Int and Float fields alike), the text family as text, and unknown
+// fields (JSON, arrays, vectors) as json.
 func typeOID(t translate.FieldType) uint32 {
-	switch t {
-	case translate.TypeNumber:
-		return pgtype.Float8OID
-	case translate.TypeBool:
-		return pgtype.BoolOID
-	case translate.TypeKeyword, translate.TypeText, translate.TypeDate:
-		return pgtype.TextOID
-	default:
-		return pgtype.JSONOID
-	}
+	return catalog.FieldTypeOID(t)
 }
 
 // search is the statement body: run the plan against the store and stream
-// the hits as data rows, then report the row count the way PG does.
-func (s *Server) search(sel *pg.Select, plan *translate.Plan, types []translate.FieldType) wire.PreparedStatementFn {
+// the hits as data rows, then report the row count the way PG does. exec is
+// the connection's database view, resolved at parse time.
+func (s *Server) search(exec store.Executor, sel *pg.Select, plan *translate.Plan, types []translate.FieldType) wire.PreparedStatementFn {
 	return func(ctx context.Context, writer wire.DataWriter, parameters []wire.Parameter) (err error) {
 		// psql-wire does not recover per connection: a panic here would take
 		// the whole gateway down.
@@ -67,7 +62,7 @@ func (s *Server) search(sel *pg.Select, plan *translate.Plan, types []translate.
 		}
 
 		start := time.Now()
-		result, err := s.exec.Search(ctx, sel.Table, plan)
+		result, err := exec.Search(ctx, sel.Table, plan)
 		if err != nil {
 			s.zapLogger().Error("query execution failed", zap.String("table", sel.Table), zap.Error(err))
 			return wireError(err)

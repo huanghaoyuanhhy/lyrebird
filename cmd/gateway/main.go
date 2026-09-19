@@ -27,7 +27,7 @@ func main() {
 }
 
 func newRootCommand() *cobra.Command {
-	var esAddr, pgAddr, milvusURI, milvusToken string
+	var esAddr, pgAddr, milvusURI, milvusToken, milvusDB string
 
 	cmd := &cobra.Command{
 		Use:   "lyrebird",
@@ -43,7 +43,7 @@ func newRootCommand() *cobra.Command {
 			defer logger.Sync()
 			zap.ReplaceGlobals(logger)
 
-			exec, err := buildExecutor(cmd.Context(), milvusURI, milvusToken, logger)
+			exec, err := buildExecutor(cmd.Context(), milvusURI, milvusToken, milvusDB, logger)
 			if err != nil {
 				return err
 			}
@@ -82,6 +82,7 @@ func newRootCommand() *cobra.Command {
 	cmd.Flags().StringVar(&pgAddr, "pg-addr", "127.0.0.1:5433", "PostgreSQL wire entry point listen address")
 	cmd.Flags().StringVar(&milvusURI, "milvus-uri", "", "Milvus/Zilliz Cloud endpoint (https://host:19530); empty runs the log-only dev executor")
 	cmd.Flags().StringVar(&milvusToken, "milvus-token", "", "Milvus auth token (API key or user:password)")
+	cmd.Flags().StringVar(&milvusDB, "milvus-db", "", "Milvus database the ES entry point and default PG connections read (\"default\")")
 
 	return cmd
 }
@@ -89,12 +90,12 @@ func newRootCommand() *cobra.Command {
 // buildExecutor picks the backing store: the real Milvus executor when an
 // endpoint is configured, the log stand-in otherwise so the gateway still
 // boots for development.
-func buildExecutor(ctx context.Context, uri, token string, logger *zap.Logger) (store.Executor, error) {
+func buildExecutor(ctx context.Context, uri, token, db string, logger *zap.Logger) (store.Cluster, error) {
 	if uri == "" {
 		logger.Info("no --milvus-uri given; searches will log and return empty results")
 		return &store.LogExecutor{Logger: logger}, nil
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	return store.NewMilvusExecutor(connectCtx, store.MilvusConfig{URI: uri, Token: token})
+	return store.NewMilvusExecutor(connectCtx, store.MilvusConfig{URI: uri, Token: token, DB: db})
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"testing"
 	"time"
 
@@ -12,16 +13,23 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
+	"github.com/huanghaoyuanhhy/lyrebird/internal/catalog"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 // fakeExecutor stands in for the Milvus executor: fixed schema per table and
-// one canned result, so the wire layer is exercised without a cluster.
+// one canned result, so the wire layer is exercised without a cluster. It
+// also serves the catalog's introspection surface — the catalog projects its
+// schemas as the default database's tables, with optional per-database
+// overrides for the routing tests.
 type fakeExecutor struct {
 	schemas map[string]translate.Schema
-	result  *store.SearchResult
-	err     error
+	// alt holds schemas for databases other than the default; absent
+	// databases answer not-found like the real store.
+	alt    map[string]map[string]translate.Schema
+	result *store.SearchResult
+	err    error
 }
 
 func (f *fakeExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {
@@ -47,8 +55,58 @@ func (f *fakeExecutor) Search(ctx context.Context, collection string, plan *tran
 	return &store.SearchResult{Total: f.result.Total, Hits: hits}, nil
 }
 
+// Database implements store.Cluster: one fake, any database.
+func (f *fakeExecutor) Database(db string) (store.Executor, error) { return f, nil }
+
+// DefaultDatabase implements store.Cluster.
+func (f *fakeExecutor) DefaultDatabase() string { return "default" }
+
+// Databases implements store.Cluster.
+func (f *fakeExecutor) Databases(ctx context.Context) ([]string, error) {
+	return []string{"default"}, nil
+}
+
+// ListCollections implements store.Cluster from the fake's schemas.
+func (f *fakeExecutor) ListCollections(ctx context.Context, db string) ([]string, error) {
+	schemas, ok := f.dbSchemas(db)
+	names := make([]string, 0, len(schemas))
+	for name := range schemas {
+		names = append(names, name)
+	}
+	if !ok {
+		return names, nil // an empty database, not an error
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// Collection implements store.Cluster: field metadata from the fake schema.
+func (f *fakeExecutor) Collection(ctx context.Context, db, name string) (catalog.CollectionMeta, error) {
+	schemas, _ := f.dbSchemas(db)
+	schema, ok := schemas[name]
+	if !ok {
+		return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, name)
+	}
+	meta := catalog.CollectionMeta{Name: name}
+	for _, field := range schema.Fields() {
+		meta.Fields = append(meta.Fields, catalog.FieldMeta{Name: field, Type: schema.FieldType(field)})
+	}
+	return meta, nil
+}
+
+// dbSchemas picks the schema set a database name resolves to.
+func (f *fakeExecutor) dbSchemas(db string) (map[string]translate.Schema, bool) {
+	switch db {
+	case "", "default":
+		return f.schemas, true
+	default:
+		schemas, ok := f.alt[db]
+		return schemas, ok
+	}
+}
+
 // startWireServer boots a Server on 127.0.0.1:0 and returns its address.
-func startWireServer(t *testing.T, exec store.Executor) net.Addr {
+func startWireServer(t *testing.T, exec store.Cluster) net.Addr {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

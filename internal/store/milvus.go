@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/milvus-io/milvus/client/v3/column"
 	"github.com/milvus-io/milvus/client/v3/entity"
@@ -16,20 +17,31 @@ import (
 )
 
 // MilvusConfig holds the connection settings for MilvusExecutor. Token is
-// either an API key (Zilliz Cloud) or a "user:password" pair.
+// either an API key (Zilliz Cloud) or a "user:password" pair. DB names the
+// Milvus database the executor reads ("" = the server default).
 //
 // URI forms: "https://host:19530" (TLS on) or "host:19530" (TLS off).
 type MilvusConfig struct {
 	URI   string
 	Token string
+	DB    string
 }
 
 // MilvusExecutor is the real Executor: it renders plans into Milvus boolean
 // expressions and runs them through the official milvus Go client
 // (milvus-io/milvus/client/v3). It is the only place in lyrebird that
 // speaks to Milvus.
+//
+// The struct doubles as the introspection half of store.Cluster: Database
+// hands out per-database views sharing one client pool, so concurrent PG
+// connections attached to different Milvus databases each get their own
+// client instead of racing UseDatabase's mutation of a shared one.
 type MilvusExecutor struct {
-	cli *milvusclient.Client
+	cfg    MilvusConfig
+	cli    *milvusclient.Client
+	db     string
+	poolMu sync.Mutex
+	pool   map[string]*milvusclient.Client
 }
 
 // compile-time check that MilvusExecutor satisfies Executor.
@@ -42,11 +54,16 @@ func NewMilvusExecutor(ctx context.Context, cfg MilvusConfig) (*MilvusExecutor, 
 		Address:       cfg.URI,
 		APIKey:        cfg.Token,
 		EnableTLSAuth: strings.HasPrefix(cfg.URI, "https://"),
+		DBName:        cfg.DB,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("connect to milvus %q: %w", cfg.URI, err)
 	}
-	return &MilvusExecutor{cli: cli}, nil
+	db := cfg.DB
+	if db == "" {
+		db = "default"
+	}
+	return &MilvusExecutor{cfg: cfg, cli: cli, db: db, pool: map[string]*milvusclient.Client{}}, nil
 }
 
 // Close releases the Milvus connection.

@@ -6,6 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/huanghaoyuanhhy/lyrebird/internal/catalog"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
@@ -47,6 +48,27 @@ type LogExecutor struct {
 	// Logger receives one structured entry per search; nil uses the global
 	// zap.L() (wired by zap.ReplaceGlobals in main).
 	Logger *zap.Logger
+}
+
+// Database implements Cluster: the stand-in has no databases to separate.
+func (e *LogExecutor) Database(db string) (Executor, error) { return e, nil }
+
+// DefaultDatabase implements Cluster.
+func (e *LogExecutor) DefaultDatabase() string { return "default" }
+
+// Databases implements Cluster.
+func (e *LogExecutor) Databases(ctx context.Context) ([]string, error) {
+	return []string{"default"}, nil
+}
+
+// ListCollections implements Cluster: the stand-in knows no collections.
+func (e *LogExecutor) ListCollections(ctx context.Context, db string) ([]string, error) {
+	return nil, nil
+}
+
+// Collection implements Cluster: nothing exists, so describe misses.
+func (e *LogExecutor) Collection(ctx context.Context, db, name string) (catalog.CollectionMeta, error) {
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", ErrCollectionNotFound, name)
 }
 
 // Schema implements Executor: the stand-in knows no fields, so every lookup
