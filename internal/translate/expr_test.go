@@ -39,6 +39,16 @@ func TestRender(t *testing.T) {
 			want: "v is not null",
 		},
 		{
+			name: "is null",
+			expr: IsNull{Field: "v"},
+			want: "v is null",
+		},
+		{
+			name: "not over not null lowers to is null",
+			expr: Not{Child: NotNull{Field: "v"}},
+			want: "v is null",
+		},
+		{
 			name: "not",
 			expr: Not{Child: Compare{Op: Eq, Field: "s", Value: StringValue("x")}},
 			want: `not (s == "x")`,

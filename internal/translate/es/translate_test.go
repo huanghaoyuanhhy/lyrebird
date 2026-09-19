@@ -181,6 +181,12 @@ func TestTranslate(t *testing.T) {
 			expr: `status is not null`,
 		},
 		{
+			name: "must_not exists is a null check",
+			body: `{"query": {"bool": {"must_not": [{"exists": {"field": "status"}}]}}}`,
+			want: basePlan(),
+			expr: `status is null`,
+		},
+		{
 			name: "bool combines must, filter and must_not",
 			body: `{"query": {"bool": {"must": [{"term": {"status": "ok"}}], "filter": [{"range": {"views": {"gte": 1}}}], "must_not": [{"term": {"status": "deleted"}}]}}}`,
 			want: basePlan(),

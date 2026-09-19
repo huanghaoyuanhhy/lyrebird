@@ -101,6 +101,13 @@ func boolExpr(b boolQuery, schema translate.Schema) (translate.Expr, error) {
 	}
 
 	for _, c := range b.mustNot {
+		// A negated exists is an IS NULL: routing it through Not would
+		// render `not (x is not null)`, which Milvus's three-valued `not`
+		// mis-filters (docs/design.md).
+		if ex, ok := c.(existsQuery); ok {
+			children = append(children, translate.IsNull{Field: ex.field})
+			continue
+		}
 		e, err := buildExpr(c, schema)
 		if err != nil {
 			return nil, err

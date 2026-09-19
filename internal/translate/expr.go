@@ -35,6 +35,11 @@ type (
 	}
 	// NotNull is the nullable-field existence check: Field is not null.
 	NotNull struct{ Field string }
+	// IsNull is the negated existence check: Field is null. It exists beside
+	// Not{NotNull} because Milvus evaluates `not` under three-valued logic —
+	// over a null field the inner verdict is unknown, not false — so a
+	// negated null check must ride its own operator, never `not`.
+	IsNull struct{ Field string }
 	// Not is logical negation.
 	Not struct{ Child Expr }
 	// And is an n-ary conjunction. One child behaves as the child itself;
@@ -52,13 +57,14 @@ func (Compare) isExpr()   {}
 func (InList) isExpr()    {}
 func (TextMatch) isExpr() {}
 func (NotNull) isExpr()   {}
+func (IsNull) isExpr()    {}
 func (Not) isExpr()       {}
 func (And) isExpr()       {}
 func (Or) isExpr()        {}
 func (Never) isExpr()     {}
 
 // Compile-time check that every node implements Expr.
-var _ = []Expr{Compare{}, InList{}, TextMatch{}, NotNull{}, Not{}, And{}, Or{}, Never{}}
+var _ = []Expr{Compare{}, InList{}, TextMatch{}, NotNull{}, IsNull{}, Not{}, And{}, Or{}, Never{}}
 
 // CompareOp is a Milvus comparison operator; the rendered form is the value.
 type CompareOp string
@@ -155,7 +161,20 @@ func renderExpr(b *strings.Builder, expr Expr) error {
 			return err
 		}
 		b.WriteString(field + " is not null")
+	case IsNull:
+		field, err := renderField(e.Field)
+		if err != nil {
+			return err
+		}
+		b.WriteString(field + " is null")
 	case Not:
+		// A negated null check lowers to the opposite null-check operator,
+		// never to `not (...)`: Milvus evaluates `not` under three-valued
+		// logic, so `not (x is not null)` filters the very rows it should
+		// keep. Both null checks are total predicates — the rewrite is exact.
+		if nn, ok := e.Child.(NotNull); ok {
+			return renderExpr(b, IsNull{Field: nn.Field})
+		}
 		b.WriteString("not (")
 		if err := renderExpr(b, e.Child); err != nil {
 			return err

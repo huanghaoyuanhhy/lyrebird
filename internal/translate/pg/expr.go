@@ -153,6 +153,12 @@ func fold(w whereExpr) whereExpr {
 		case child == nil:
 			return wFalse{}
 		}
+		// NOT pushes into a null check (NOT (x IS NULL) is x IS NOT NULL):
+		// leaving the `not` in place would render `not (x is null)`, which
+		// Milvus evaluates under three-valued logic and mis-filters.
+		if n, ok := child.(wNull); ok {
+			return wNull{col: n.col, negated: !n.negated}
+		}
 		return wNot{child}
 	}
 	return w
@@ -295,11 +301,13 @@ func buildWhere(w whereExpr, schema translate.Schema) (translate.Expr, error) {
 		}
 		return bounds, nil
 	case wNull:
-		notNull := translate.NotNull{Field: e.col}
+		// IS NOT NULL rides the NotNull node; IS NULL gets its own node —
+		// wrapping it in Not would render `not (x is not null)`, which
+		// Milvus's three-valued `not` mis-filters (docs/design.md).
 		if e.negated {
-			return notNull, nil
+			return translate.NotNull{Field: e.col}, nil
 		}
-		return translate.Not{Child: notNull}, nil
+		return translate.IsNull{Field: e.col}, nil
 	}
 	return nil, fmt.Errorf("internal: unhandled where node %T", w)
 }
