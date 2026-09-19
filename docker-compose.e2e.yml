@@ -28,7 +28,9 @@ services:
       retries: 12
 
   minio:
-    image: minio/minio:RELEASE.2024-05-28T17-19-04Z
+    # quay is MinIO's only current home — the docker hub repository was
+    # removed (2025), old tags pull-denied there.
+    image: quay.io/minio/minio:RELEASE.2024-05-28T17-19-04Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
