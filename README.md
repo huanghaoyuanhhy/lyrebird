@@ -109,7 +109,18 @@ curl -XPOST 127.0.0.1:9200/idx/_search \
   -d '{"query":{"range":{"price":{"gte":10}}},"sort":[{"price":"desc"}],"from":0,"size":5}'
 ```
 
-The e2e suites (`internal/store`, `internal/esserver`) run against a real
-Milvus/Zilliz Cloud instance when `LYREBIRD_TEST_MILVUS_URI` and
-`LYREBIRD_TEST_MILVUS_TOKEN` are set, and skip otherwise — credentials stay
-out of the repo.
+The e2e suites skip unless configured, so credentials stay out of the repo:
+
+- `LYREBIRD_TEST_MILVUS_URI` / `LYREBIRD_TEST_MILVUS_TOKEN` — any real Milvus
+  (or Zilliz Cloud); the full-stack suites (store executor, ES surface, PG
+  wire) run against it.
+- `LYREBIRD_TEST_ES_ADDR` — a real Elasticsearch; the ES parity suite
+  replays the same search bodies against both and compares totals and hit
+  ids.
+- `LYREBIRD_TEST_PG_DSN` — a real Postgres with pgvector; the PG parity
+  suite replays the same SQL against both and compares columns and rows.
+
+`make e2e` boots all three stacks (`docker-compose.e2e.yml`: Milvus
+standalone, Elasticsearch 8.x, Postgres+pgvector), seeds the same fixtures
+into each, and runs everything; the `E2E` GitHub Actions workflow runs the
+same thing on every push and pull request.

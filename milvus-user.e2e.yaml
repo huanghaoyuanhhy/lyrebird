@@ -1,0 +1,9 @@
+# milvus-user.e2e.yaml — e2e-only overlay for the compose Milvus (mounted as
+# /milvus/configs/user.yaml): the fixture suites seed three collections per
+# run (flush + index + load each), which trips the standalone default of 0.1
+# collection flushes per second. Only this stack is affected.
+quotaAndLimits:
+  limits:
+    flushRate:
+      collection:
+        max: -1
