@@ -224,16 +224,16 @@ var catalogTables = []tableDef{
 		},
 		build: func(ctx context.Context, s *snapshot) ([][]any, error) {
 			return collectionRows(ctx, s, func(coll CollectionMeta, tableOID uint64) ([][]any, error) {
-			return [][]any{{
-				float64(tableOID), coll.Name, float64(publicNSOID),
-				"r", float64(ownerOID), float64(0),
-				float64(0), float64(0), float64(0),
-				false, false, false,
-				"p", float64(len(coll.Fields)), false,
-				float64(0), float64(0), false, false,
-				true, "d", float64(0),
-				nil,
-			}}, nil
+				return [][]any{{
+					float64(tableOID), coll.Name, float64(publicNSOID),
+					"r", float64(ownerOID), float64(0),
+					float64(0), float64(0), float64(0),
+					false, false, false,
+					"p", float64(len(coll.Fields)), false,
+					float64(0), float64(0), false, false,
+					true, "d", float64(0),
+					nil,
+				}}, nil
 			})
 		},
 	},
@@ -442,7 +442,7 @@ var catalogTables = []tableDef{
 			}
 			rows := make([][]any, 0, len(names))
 			for _, name := range names {
-				rows = append(rows, row( s.db, "public", name, "BASE TABLE", "YES", nil))
+				rows = append(rows, row(s.db, "public", name, "BASE TABLE", "YES", nil))
 			}
 			return rows, nil
 		},

@@ -391,4 +391,3 @@ func ReferencesCatalogTables(sql string) bool {
 	}
 	return false
 }
-

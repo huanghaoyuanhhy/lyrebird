@@ -9,13 +9,13 @@ import "strings"
 type tokenKind int
 
 const (
-	tkEOF   tokenKind = iota
-	tkKeyword         // reserved word; text holds the canonical upper-case form
-	tkIdent           // bare or "quoted" identifier; text holds the name as written
-	tkString          // single-quoted literal; text holds the value with '' unescaped
-	tkNumber          // numeric literal; text holds the digits as written
-	tkOp              // operator or punctuation; text holds the characters
-	tkParam           // $n placeholder; text holds "$n"
+	tkEOF     tokenKind = iota
+	tkKeyword           // reserved word; text holds the canonical upper-case form
+	tkIdent             // bare or "quoted" identifier; text holds the name as written
+	tkString            // single-quoted literal; text holds the value with '' unescaped
+	tkNumber            // numeric literal; text holds the digits as written
+	tkOp                // operator or punctuation; text holds the characters
+	tkParam             // $n placeholder; text holds "$n"
 )
 
 type token struct {
@@ -161,7 +161,7 @@ func lexBlockComment(src string, start int) (int, bool) {
 }
 
 // lexQuoted reads a single-quoted string or double-quoted identifier whose
-// terminator is doubled ('' or "") to embed itself.
+// terminator is doubled (” or "") to embed itself.
 func lexQuoted(src string, start int, quote byte) (text string, n int, err error) {
 	var b strings.Builder
 	i := start + 1

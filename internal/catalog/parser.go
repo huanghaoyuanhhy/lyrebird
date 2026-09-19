@@ -12,7 +12,7 @@ import (
 type expr interface{}
 
 type literal struct {
-	v    any // string, float64, bool, nil
+	v any // string, float64, bool, nil
 }
 
 type colRef struct {
@@ -62,7 +62,7 @@ type whenClause struct {
 }
 
 type castExpr struct {
-	e     expr
+	e      expr
 	target string // lower-cased type name
 }
 
@@ -159,8 +159,8 @@ func parseSQL(src string) (*stmt, error) {
 	return st, nil
 }
 
-func (p *parser) peek() token  { return p.toks[p.i] }
-func (p *parser) next() token  { t := p.toks[p.i]; p.i++; return t }
+func (p *parser) peek() token { return p.toks[p.i] }
+func (p *parser) next() token { t := p.toks[p.i]; p.i++; return t }
 
 func (p *parser) isKeyword(word string) bool {
 	t := p.peek()

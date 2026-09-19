@@ -71,7 +71,7 @@ func ackStatement(tag string) wire.PreparedStatements {
 
 // showAliases maps PG's multi-word SHOW forms onto their setting names.
 var showAliases = map[string]string{
-	"time zone":                    "TimeZone",
+	"time zone":                   "TimeZone",
 	"transaction isolation level": "transaction_isolation",
 	"session authorization":       "session_authorization",
 }

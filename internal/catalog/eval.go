@@ -190,8 +190,6 @@ func bindSources(ctx context.Context, snap *snapshot, sources []sourceSpec) ([]b
 	return out, nil
 }
 
-
-
 // joinRows builds every row combination the FROM clause produces: sources
 // extend left to right, each joining by its kind, LEFT keeping unmatched
 // combinations with an all-null row.
