@@ -23,6 +23,19 @@ type Executor interface {
 	// choices (match → exact compare vs token match) follow the real fields;
 	// absent fields read as translate.TypeUnknown.
 	Schema(ctx context.Context, collection string) (translate.Schema, error)
+
+	// Describe answers the fine-grained collection metadata (storage types,
+	// nullability, dims, primary key, auto-generation) the strict write path
+	// validates against. Reads lean on Schema's coarse vocabulary; writes
+	// need the detail.
+	Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error)
+
+	// Insert writes new rows, rejecting any input that does not match the
+	// live collection schema (the strict write path — docs/design.md).
+	Insert(ctx context.Context, collection string, rows []translate.WriteRow) (WriteResult, error)
+
+	// Upsert writes rows by primary key, replacing each stored row whole.
+	Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (WriteResult, error)
 }
 
 // Hit is one matched entity: its primary key and the fields fetched for it.
@@ -80,6 +93,33 @@ func (e *LogExecutor) CollectionStats(ctx context.Context, db, name string) (int
 // reads as unknown — the same answer as a real collection with no fields.
 func (e *LogExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {
 	return translate.MapSchema{}, nil
+}
+
+// Describe implements Executor: nothing exists, so every describe misses.
+func (e *LogExecutor) Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error) {
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", ErrCollectionNotFound, collection)
+}
+
+// Insert implements Executor: the stand-in writes nowhere, logging the rows.
+func (e *LogExecutor) Insert(ctx context.Context, collection string, rows []translate.WriteRow) (WriteResult, error) {
+	logger := e.Logger
+	if logger == nil {
+		logger = zap.L()
+	}
+	logger.Info("store: insert (log executor)",
+		zap.String("collection", collection), zap.Int("rows", len(rows)))
+	return WriteResult{Count: int64(len(rows))}, nil
+}
+
+// Upsert implements Executor: the stand-in writes nowhere, logging the rows.
+func (e *LogExecutor) Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (WriteResult, error) {
+	logger := e.Logger
+	if logger == nil {
+		logger = zap.L()
+	}
+	logger.Info("store: upsert (log executor)",
+		zap.String("collection", collection), zap.Int("rows", len(rows)))
+	return WriteResult{Count: int64(len(rows))}, nil
 }
 
 // Search implements Executor. Render errors are returned, not swallowed:

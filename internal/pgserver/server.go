@@ -148,7 +148,37 @@ func (s *Server) parseOne(ctx context.Context, query string) (wire.PreparedState
 		}
 	}
 
-	// 3. collection reads: the translate/pg pipeline, against the
+	// 3. write statements: INSERT / UPDATE, the parallel write lane (the
+	// design's narrow path — write rows, not read plans). Parsing is
+	// schema-free; the statement body resolves the schema when executed.
+	if words, err := catalog.Words(query); err == nil && len(words) > 0 {
+		switch strings.ToUpper(words[0]) {
+		case "INSERT":
+			ins, err := pg.ParseInsert(query)
+			if err != nil {
+				logger.Warn("pg insert rejected", zap.Error(err))
+				return nil, wireError(err)
+			}
+			exec, err := s.databaseView(ctx)
+			if err != nil {
+				return nil, wireError(err)
+			}
+			return wire.Prepared(wire.NewStatement(s.writeInsertStatement(exec, ins))), nil
+		case "UPDATE":
+			upd, err := pg.ParseUpdate(query)
+			if err != nil {
+				logger.Warn("pg update rejected", zap.Error(err))
+				return nil, wireError(err)
+			}
+			exec, err := s.databaseView(ctx)
+			if err != nil {
+				return nil, wireError(err)
+			}
+			return wire.Prepared(wire.NewStatement(s.writeUpdateStatement(exec, upd))), nil
+		}
+	}
+
+	// 4. collection reads: the translate/pg pipeline, against the
 	// connection's database view.
 	sel, err := pg.Parse(query)
 	if err != nil {

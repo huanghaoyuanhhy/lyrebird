@@ -144,18 +144,21 @@ func (e *MilvusExecutor) CollectionStats(ctx context.Context, db, name string) (
 func catalogMeta(coll *entity.Collection) catalog.CollectionMeta {
 	meta := catalog.CollectionMeta{Name: coll.Schema.CollectionName}
 	funcOutputs := functionOutputFields(coll.Schema)
+	meta.FunctionOutputs = append(meta.FunctionOutputs, funcOutputs...)
 	for _, f := range coll.Schema.Fields {
 		if isFunctionOutput(f.Name, funcOutputs) {
 			continue
 		}
 		meta.Fields = append(meta.Fields, catalog.FieldMeta{
-			Name:       f.Name,
-			Type:       translateFieldType(f),
-			PrimaryKey: f.PrimaryKey,
-			Nullable:   f.Nullable,
-			Dim:        typeParamInt(f.TypeParams, "dim"),
-			MaxLength:  typeParamInt(f.TypeParams, "max_length"),
-			Native:     nativeTypeName(f.DataType),
+			Name:        f.Name,
+			Type:        translateFieldType(f),
+			PrimaryKey:  f.PrimaryKey,
+			Nullable:    f.Nullable,
+			Dim:         typeParamInt(f.TypeParams, "dim"),
+			MaxLength:   typeParamInt(f.TypeParams, "max_length"),
+			Native:      nativeTypeName(f.DataType),
+			AutoID:      f.AutoID,
+			ElementType: nativeTypeName(f.ElementType),
 		})
 	}
 	return meta

@@ -48,6 +48,8 @@ var keywords = map[string]bool{
 	"PREPARE": true, "EXECUTE": true, "EXPLAIN": true, "ANALYZE": true,
 	"VACUUM": true, "COPY": true, "GRANT": true, "REVOKE": true,
 	"VALUES": true, "TABLE": true, "CALL": true, "LOCK": true,
+	// write-path clauses rejected by name (the write parser names them)
+	"DEFAULT": true, "RETURNING": true,
 }
 
 // operators lists the operator/punctuation tokens longest first, so "<=>"

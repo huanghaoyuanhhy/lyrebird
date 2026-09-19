@@ -233,7 +233,11 @@ func (e *MilvusExecutor) vectorSearch(ctx context.Context, collection string, pl
 		WithANNSField(spec.Field).
 		WithFilter(expr).
 		WithOutputFields(proj.fetch...).
-		WithOffset(plan.Offset)
+		WithOffset(plan.Offset).
+		// Strong: ES and PG clients read their own writes — a search right
+		// after an index/update must see it, not Milvus's default bounded
+		// (≤2s) visibility window.
+		WithConsistencyLevel(entity.ClStrong)
 	if spec.Metric != "" {
 		// A filled metric is a semantic statement the protocol made: the
 		// pgvector operators name their metric (`<=>` means cosine, not
@@ -302,7 +306,8 @@ func (e *MilvusExecutor) queryPage(ctx context.Context, collection, expr string,
 		WithFilter(expr).
 		WithOutputFields(outputFields...).
 		WithOffset(offset).
-		WithLimit(limit)
+		WithLimit(limit).
+		WithConsistencyLevel(entity.ClStrong) // read-your-writes, see above
 	rs, err := e.queryOpt(ctx, collection, opt)
 	if err != nil {
 		return nil, err
@@ -366,7 +371,8 @@ func joinAnd(a, b string) string {
 func (e *MilvusExecutor) count(ctx context.Context, collection, expr string) (int64, error) {
 	rs, err := e.queryOpt(ctx, collection, milvusclient.NewQueryOption(collection).
 		WithFilter(expr).
-		WithOutputFields("count(*)"))
+		WithOutputFields("count(*)").
+		WithConsistencyLevel(entity.ClStrong))
 	if err != nil {
 		return 0, err
 	}

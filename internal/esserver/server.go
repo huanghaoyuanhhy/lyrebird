@@ -30,6 +30,7 @@ func New(cluster store.Cluster, logger *zap.Logger) *Server {
 	s.mux.HandleFunc("POST /{index}/_search", s.search)
 	s.mux.HandleFunc("GET /{index}/_search", s.search)
 	s.installCatalogRoutes()
+	s.installWriteRoutes()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no such endpoint: "+r.Method+" "+r.URL.Path)
 	})

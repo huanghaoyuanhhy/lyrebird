@@ -30,6 +30,63 @@ type fakeExecutor struct {
 
 	gotIndex string
 	gotPlan  *translate.Plan
+
+	// writeCalls records every Insert/Upsert the fake was asked to run.
+	writeCalls []writeCall
+	insertErr  error
+	// insertIDs plays the store-assigned primary keys (auto-id inserts).
+	insertIDs []string
+}
+
+// writeCall is one recorded write.
+type writeCall struct {
+	Collection string
+	Rows       []translate.WriteRow
+	Upsert     bool
+}
+
+// Describe implements store.Executor from the fake's metas.
+func (f *fakeExecutor) Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error) {
+	for _, m := range f.metas {
+		if m.Name == collection {
+			return m, nil
+		}
+	}
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, collection)
+}
+
+// Insert implements store.Executor: the same strict validation the real
+// executor runs (so handler tests exercise the full rejection path), then
+// records the call.
+func (f *fakeExecutor) Insert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
+	meta, err := f.Describe(ctx, collection)
+	if err != nil {
+		return store.WriteResult{}, err
+	}
+	if err := store.ValidateWriteRows(meta, rows); err != nil {
+		return store.WriteResult{}, err
+	}
+	if f.insertErr != nil {
+		return store.WriteResult{}, f.insertErr
+	}
+	f.writeCalls = append(f.writeCalls, writeCall{Collection: collection, Rows: rows})
+	return store.WriteResult{Count: int64(len(rows)), IDs: f.insertIDs}, nil
+}
+
+// Upsert implements store.Executor, validating and recording like Insert.
+func (f *fakeExecutor) Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
+	meta, err := f.Describe(ctx, collection)
+	if err != nil {
+		return store.WriteResult{}, err
+	}
+	if err := store.ValidateWriteRows(meta, rows); err != nil {
+		return store.WriteResult{}, err
+	}
+	if f.insertErr != nil {
+		return store.WriteResult{}, f.insertErr
+	}
+	f.writeCalls = append(f.writeCalls, writeCall{Collection: collection, Rows: rows, Upsert: true})
+	return store.WriteResult{Count: int64(len(rows))}, nil
 }
 
 func (f *fakeExecutor) Search(ctx context.Context, collection string, plan *translate.Plan) (*store.SearchResult, error) {
@@ -427,4 +484,19 @@ func (panickyExecutor) Collection(ctx context.Context, db, name string) (catalog
 // CollectionStats implements store.Cluster.
 func (panickyExecutor) CollectionStats(ctx context.Context, db, name string) (int64, error) {
 	return 0, nil
+}
+
+// Describe implements store.Executor: the panic test only searches.
+func (panickyExecutor) Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error) {
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, collection)
+}
+
+// Insert implements store.Executor: the panic test only searches.
+func (panickyExecutor) Insert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
+	return store.WriteResult{}, nil
+}
+
+// Upsert implements store.Executor: the panic test only searches.
+func (panickyExecutor) Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
+	return store.WriteResult{}, nil
 }

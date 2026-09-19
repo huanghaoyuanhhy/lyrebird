@@ -30,6 +30,37 @@ type fakeExecutor struct {
 	alt    map[string]map[string]translate.Schema
 	result *store.SearchResult
 	err    error
+
+	// writeCalls records every Insert/Upsert the fake was asked to run.
+	writeCalls []writeCall
+	writeErr   error
+}
+
+// writeCall is one recorded write.
+type writeCall struct {
+	Collection string
+	Rows       []translate.WriteRow
+	Upsert     bool
+}
+
+func (f *fakeExecutor) Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error) {
+	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, collection)
+}
+
+func (f *fakeExecutor) Insert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
+	if f.writeErr != nil {
+		return store.WriteResult{}, f.writeErr
+	}
+	f.writeCalls = append(f.writeCalls, writeCall{Collection: collection, Rows: rows})
+	return store.WriteResult{Count: int64(len(rows))}, nil
+}
+
+func (f *fakeExecutor) Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
+	if f.writeErr != nil {
+		return store.WriteResult{}, f.writeErr
+	}
+	f.writeCalls = append(f.writeCalls, writeCall{Collection: collection, Rows: rows, Upsert: true})
+	return store.WriteResult{Count: int64(len(rows))}, nil
 }
 
 func (f *fakeExecutor) Schema(ctx context.Context, collection string) (translate.Schema, error) {

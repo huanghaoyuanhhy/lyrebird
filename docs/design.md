@@ -359,3 +359,93 @@ those queries' real text.
      needs sub-query trees, not just predicate trees);
   3. plan-level transforms start needing language-neutral query shape (sort/source
      rewrites across both frontends).
+
+## Settled — write path: strict-schema inserts and updates (2026-09-19)
+
+Goal: INSERT/UPDATE on the pg entry, the index/update APIs on the ES entry,
+against existing collections only — no DDL, no dynamic fields. The user's
+call for this slice: **strict** — an input that does not match the live
+collection schema is rejected, never coerced, never auto-mapped. This
+settles the 2026-09-18 proposal's value-conversion question (no lossy
+widening; exactness or refusal) and its dynamic-mapping question (refused;
+DDL remains a separate later slice).
+
+- **Shape**: the write path is a parallel narrow lane, not a Plan — write
+  rows, not read plans. Each frontend parses its own statements
+  (translate/pg: Insert/Update ASTs; translate/es: document decoding)
+  into `translate.WriteRow` (field → value), and store executes
+  `Executor.Insert` / `Executor.Upsert` after validating against
+  `Executor.Describe` (the catalog.CollectionMeta the introspection
+  surface already serves — writes are checked against exactly what
+  clients are told the schema is).
+- **Write value vocabulary** (translate.WriteRow): string; numbers as
+  json.Number (the digits as written — Int64 keeps full 64-bit precision,
+  no float round-trip); bool; nil (explicit NULL); []float32 (the fp32
+  vector family); json.RawMessage/[]byte for JSON fields. Reads return
+  the storage encodings (int64/float64/...), so validation also accepts
+  them — a read-modify-write can upsert exactly what it fetched.
+- **Strict rejection classes** (store.WriteError, one classification both
+  protocols render natively): unknown field (ES strict_dynamic_mapping
+  / pg 42703), function-owned field (BM25 outputs — the store computes
+  them), auto-id key supplied, missing non-nullable field (23502), NULL
+  into non-nullable (23502), type mismatch (document_parsing / 42804),
+  numeric range (22003), string > max_length (22001), vector ≠ dim
+  (illegal_argument / 22023), storage type with no write encoding —
+  arrays, fp16/bf16/binary/int8/sparse vectors, timestamptz — refused
+  with the type named (0A000). Nullable-but-unwritable fields ride as
+  omitted columns instead of blocking writes on collections that have
+  them.
+- **ES surface**: PUT/POST `/{index}/_doc[/{id}]` (index API = whole-row
+  put: insert when the key is free → 201 created, upsert when taken →
+  200 updated; `?op_type=create` and `/{index}/_create/{id}` → 409
+  version_conflict on collision), `/{index}/_update/{id}` (read-merge-
+  write; ES's detect_noop default is honored — an unchanged doc answers
+  result=noop and writes nothing; a missing doc is 404
+  document_missing_exception; script/scripted_upsert/doc_as_upsert
+  refused by name). `_bulk` refuses by name (ndjson envelope is its own
+  later slice). `_id` semantics: VarChar pk — the URL id is the key, a
+  pk value inside the document must agree; generated ids (20 url-safe
+  chars, ES's shape) when no URL id; Int64 pk without auto-id — the URL
+  id parses to the key (an ES-shaped generated id is not a number →
+  refused); auto-id pk — no id may be supplied, POST without one, the
+  store-assigned key is reported as _id. `_version` is always 1 with
+  neutral _seq_no/_primary_term (the store has no row versioning);
+  version/if_seq_no/if_primary_term parameters refuse by name (silence
+  would promise concurrency control lyrebird does not provide).
+- **PG surface**: INSERT INTO t [(cols)] VALUES (…)[, (…)] — the
+  positional default fills every writable field in storage order
+  (function outputs are not writable and never counted); multi-row is
+  one statement, one Milvus insert; ON CONFLICT / INSERT…SELECT /
+  DEFAULT / RETURNING refuse by name; bind parameters stay unwired
+  (inline the literals). UPDATE t SET col = literal, … WHERE … — WHERE
+  is mandatory (a bare UPDATE would rewrite the collection, refused the
+  way a read without LIMIT is); SET holds literals only (self-referencing
+  expressions are beyond the lane); qualifiers strip against the table
+  name. Execution is read-modify-write: fetch every match (whole rows,
+  capped at the same 10000 window reads sort in), apply SET, upsert each
+  back, `UPDATE n` completes. `INSERT 0 n` keeps PG's tag shape.
+- **pk/autoID policy**: this settles the 2026-09-18 proposal's key
+  question for the current surface — pk is client-owned unless the
+  schema says AutoID (then it is store-owned, always); ES _id and the
+  pk column are one and the same value, cross-checked when both are
+  given (a disagreement is a 400, not a silent pick). Server-side
+  defaults and Function-owned column defaults stay open questions for
+  the DDL slice.
+- **Noop/equality**: _update's noop check compares values across the two
+  encodings (stored int64/float64 vs written json.Number) numerically,
+  and JSON fields as parsed values — re-sending byte-different but
+  semantically identical JSON is still a noop.
+- **Consistency, precisely**: all store reads (query, count, search) now
+  request Strong explicitly — Milvus's default is Bounded (≤2s visibility),
+  which would let an ES/PG client's read-your-writes fail silently. Strong
+  narrows the window to sub-second; growing-segment propagation is still a
+  platform fact, so the e2e read-backs poll (≤10s) instead of assuming.
+  Observed while testing (v3.0.2-compatible server): a search whose metric
+  disagrees with the field's index (`<=>` cosine over an L2 index) comes
+  back **empty** rather than erroring — the read path's "server rejects a
+  disagreeing metric" assumption no longer holds on this server; a local
+  metric-vs-index check is a candidate follow-up.
+- **Not done here**: DELETE (doc or by_query), _bulk, _update_by_query,
+  scripts, DDL (create index/mapping), array/sparse write encodings,
+  upsert-by-ES-of-partial-doc (the ES index API stays whole-row put, as
+  ES defines it).

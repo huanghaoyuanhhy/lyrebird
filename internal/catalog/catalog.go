@@ -43,13 +43,23 @@ type FieldMeta struct {
 	// vocabulary can (the ES mapping's long vs double) without a second
 	// provider call.
 	Native string
+	// AutoID marks the primary key the store fills itself; writers must not
+	// supply a value for it.
+	AutoID bool
+	// ElementType is an Array field's element type name (the same vocabulary
+	// as Native); empty on non-array fields.
+	ElementType string
 }
 
 // CollectionMeta is one collection's catalog view: the name plus its fields
-// in storage order (the order pg_attribute.attnum reports).
+// in storage order (the order pg_attribute.attnum reports). FunctionOutputs
+// lists the schema functions' output fields (e.g. a BM25 function's sparse
+// vector): the store computes them, so they are neither readable nor
+// writable, and a write naming one gets a dedicated error.
 type CollectionMeta struct {
-	Name   string
-	Fields []FieldMeta
+	Name            string
+	Fields          []FieldMeta
+	FunctionOutputs []string
 }
 
 // Provider supplies the live metadata the virtual tables project. The

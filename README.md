@@ -53,9 +53,10 @@ internal/esserver        ES-compatible REST server (Phase 1)
 internal/catalog         pg_catalog / information_schema projection + its
                          query engine (Phase 3a)
 internal/translate
-    ├─ pg/               SQL → Select (IR) → fold → Plan
-    └─ es/               ES Query DSL → queryNode (IR) → fold → Plan
-internal/store           Milvus Executor: Schema(collection) + Search(collection, plan)
+    ├─ pg/               SQL → Select/Insert/Update (IR) → fold → Plan / write rows
+    └─ es/               ES Query DSL → queryNode (IR) → fold → Plan; documents → write rows
+internal/store           Milvus Executor: Search(collection, plan) +
+                         strict-schema Insert/Upsert(collection, rows)
 ```
 
 Principle: **the translation layer is pure functions** — parse → private IR →
@@ -109,7 +110,25 @@ capability set (joins, aggregations) fail fast with an error — no degraded emu
 - [ ] **Phase 3b** Schema catalog config: external-name mapping (config-first
   + describe validation, design.md decision 6); DDL (CREATE TABLE →
   CreateCollection)
-- [ ] **Phase 4** Write path: insert/update/delete → upsert/delete
+- [x] **Phase 4a** Write path (strict): inserts and partial updates over both
+  protocols, against existing collections
+  - [x] `internal/store` write lane: `Executor.Insert` / `Executor.Upsert`
+    validate every row against the live schema before anything is sent —
+    unknown fields, type mismatches, range/length/dimension overruns, NULLs
+    into non-nullable fields, auto-id keys and function-owned fields are all
+    rejected, never coerced, never dynamically mapped (one rejection
+    classification, rendered as SQLSTATEs or ES exception types per protocol)
+  - [x] ES: PUT/POST `/{index}/_doc[/{id}]` (insert 201 / upsert 200),
+    `/{index}/_create/{id}` (409 on collision), `/{index}/_update/{id}`
+    (read-merge-write, detect_noop, 404 on missing); ES `_id` = the primary
+    key, auto-id collections get store-assigned ids; `_bulk` and scripts
+    refuse by name
+  - [x] PG: `INSERT INTO t [(cols)] VALUES …` (multi-row, positional
+    default in storage order) and `UPDATE t SET … WHERE …` (mandatory WHERE,
+    literals only, read-modify-write upsert capped at the read window);
+    `INSERT 0 n` / `UPDATE n` command tags
+- [ ] **Phase 4b** Write path (rest): DELETE, `_bulk`, `_update_by_query`,
+  DDL (CREATE TABLE → CreateCollection)
 - [ ] **Phase 5** Full-text alignment: ES match → Milvus BM25, score semantics aligned
 
 See [docs/design.md](docs/design.md) for design details and decision points.

@@ -36,6 +36,17 @@ const TextCollection = "lyrebird_e2e_text"
 // [1 2 3 4 5] under both cosine and L2 (no ties to smooth over).
 const VectorCollection = "lyrebird_e2e_vec"
 
+// WriteCollection is the write-path fixture: the scalar shape with a
+// nullable field and a small vector, seeded empty — the write suites fill
+// it and read it back.
+const WriteCollection = "lyrebird_e2e_write"
+
+// AutoIDCollection is the auto-generated-key fixture: Milvus assigns ids.
+const AutoIDCollection = "lyrebird_e2e_autoid"
+
+// StringPKCollection is the string-key fixture: the URL id is the key.
+const StringPKCollection = "lyrebird_e2e_strpk"
+
 // Config is a parsed endpoint.
 type Config struct {
 	URI   string
@@ -79,7 +90,54 @@ func Seed(ctx context.Context, cfg Config) error {
 	if err := seedVec(ctx, cli); err != nil {
 		return fmt.Errorf("vector fixture: %w", err)
 	}
+	if err := seedWrite(ctx, cli); err != nil {
+		return fmt.Errorf("write fixtures: %w", err)
+	}
 	return nil
+}
+
+// seedWrite rebuilds the write-path fixtures, all empty: the suites insert
+// through lyrebird itself and read back.
+//
+//	lyrebird_e2e_write: id (int64 pk), name, price, active, note (null), emb (dim 2)
+//	lyrebird_e2e_autoid: id (int64 pk, auto-generated), v
+//	lyrebird_e2e_strpk:  id (varchar pk), v
+func seedWrite(ctx context.Context, cli *milvusclient.Client) error {
+	if err := recreate(ctx, cli, WriteCollection, entity.NewSchema().
+		WithName(WriteCollection).
+		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
+		WithField(entity.NewField().WithName("name").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32)).
+		WithField(entity.NewField().WithName("price").WithDataType(entity.FieldTypeDouble)).
+		WithField(entity.NewField().WithName("active").WithDataType(entity.FieldTypeBool)).
+		WithField(entity.NewField().WithName("note").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32).WithNullable(true)).
+		WithField(entity.NewField().WithName("emb").WithDataType(entity.FieldTypeFloatVector).WithDim(2))); err != nil {
+		return err
+	}
+	if err := finalize(ctx, cli, WriteCollection, "emb", entity.L2); err != nil {
+		return err
+	}
+
+	// Milvus refuses collections without a vector field, so the scalar-key
+	// fixtures carry a nullable dim-2 vector the write rows may omit.
+	if err := recreate(ctx, cli, AutoIDCollection, entity.NewSchema().
+		WithName(AutoIDCollection).
+		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true).WithIsAutoID(true)).
+		WithField(entity.NewField().WithName("v").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32)).
+		WithField(entity.NewField().WithName("emb").WithDataType(entity.FieldTypeFloatVector).WithDim(2).WithNullable(true))); err != nil {
+		return err
+	}
+	if err := finalize(ctx, cli, AutoIDCollection, "emb", entity.L2); err != nil {
+		return err
+	}
+
+	if err := recreate(ctx, cli, StringPKCollection, entity.NewSchema().
+		WithName(StringPKCollection).
+		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32).WithIsPrimaryKey(true)).
+		WithField(entity.NewField().WithName("v").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32)).
+		WithField(entity.NewField().WithName("emb").WithDataType(entity.FieldTypeFloatVector).WithDim(2).WithNullable(true))); err != nil {
+		return err
+	}
+	return finalize(ctx, cli, StringPKCollection, "emb", entity.L2)
 }
 
 // seedDocs rebuilds the scalar fixture: five docs with distinct prices
