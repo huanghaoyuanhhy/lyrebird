@@ -83,6 +83,20 @@ func TestEsserverParity(t *testing.T) {
 		{"knn l2 order", milvustest.Collection,
 			`{"knn":{"field":"emb","query_vector":[0.1,0.2,0.3,0.4],"k":5,"num_candidates":100}}`, true, false},
 		{"match token set", milvustest.TextCollection, `{"query":{"match":{"body":"quick brown"}}}`, false, false},
+		// msm default divergence: fold drops match_all from must/filter before
+		// computing the default minimum_should_match, flipping the ES default
+		// from 0 to 1 — Elasticsearch matches all five docs in the first three
+		// cases, the gateway answers only bravo (or nothing). Red until the
+		// default is pinned at parse time; the explicit-msm control below shows
+		// only the default path is broken.
+		{"msm default: match_all in must keeps should optional", milvustest.Collection,
+			`{"query":{"bool":{"must":[{"match_all":{}}],"should":[{"term":{"name":"bravo"}}]}}}`, false, false},
+		{"msm default: match_all in filter keeps should optional", milvustest.Collection,
+			`{"query":{"bool":{"filter":[{"match_all":{}}],"should":[{"term":{"name":"bravo"}}]}}}`, false, false},
+		{"msm default: impossible optional should stays harmless", milvustest.Collection,
+			`{"query":{"bool":{"must":[{"match_all":{}}],"should":[{"match_none":{}}]}}}`, false, false},
+		{"msm explicit 1 requires the should even over match_all", milvustest.Collection,
+			`{"query":{"bool":{"must":[{"match_all":{}}],"should":[{"term":{"name":"bravo"}}],"minimum_should_match":1}}}`, false, false},
 	}
 
 	for _, tc := range cases {
