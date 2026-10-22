@@ -1,0 +1,87 @@
+name: CI label
+
+# `needs` only reaches jobs in the same workflow, so the Test workflow cannot
+# gate the ci-passed label on the separate E2E workflow. This aggregator runs
+# after any CI workflow finishes and reconciles the label with the full check
+# rollup of the PR head commit. It runs on the default branch, with no checkout
+# and no PR code executed, so fork pull requests are safe to label.
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - E2E
+    types:
+      - completed
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+  statuses: read
+
+# Serialize runs for the same commit: the Test and E2E workflows usually finish
+# moments apart, and each run makes a read-then-write decision on the label.
+# Only the newest queued run survives, which is fine because it reads the full
+# rollup anyway.
+concurrency:
+  group: ci-label-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile ci-passed
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Ensure ci-passed label exists
+        run: gh label create ci-passed --color 0e8a16 --description "All CI checks passed" || true
+      - name: Reconcile the label with the check rollup
+        run: |
+          pr=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/pulls" --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            echo "no pull request associated with $HEAD_SHA; nothing to label"
+            exit 0
+          fi
+
+          # A newer push may already be under test; that run owns the label.
+          pr_sha=$(gh api "repos/$GH_REPO/pulls/$pr" --jq '.head.sha')
+          if [ "$pr_sha" != "$HEAD_SHA" ]; then
+            echo "PR #$pr moved on to $pr_sha; ignoring the stale run for $HEAD_SHA"
+            exit 0
+          fi
+
+          # gh pr checks exits non-zero when checks are failing or pending while
+          # still printing the rollup, so its status is deliberately ignored.
+          # Drop this workflow's own check (worker runs that do land on the head
+          # commit must not deadlock on their own pending status) and collapse
+          # re-runs to the newest result per check name.
+          raw=$(gh pr checks "$pr" --json name,bucket,workflow,startedAt || true)
+          if [ -z "$raw" ]; then
+            echo "could not read checks for PR #$pr; leaving the label untouched"
+            exit 0
+          fi
+          checks=$(echo "$raw" | jq '[.[] | select(.workflow != "CI label")] | group_by(.name) | map(max_by(.startedAt // ""))')
+          if [ "$(echo "$checks" | jq 'length')" -eq 0 ]; then
+            echo "PR #$pr has no checks yet; leaving the label untouched"
+            exit 0
+          fi
+          echo "$checks" | jq -r '.[] | "\(.bucket)\t\(.name)"'
+
+          if echo "$checks" | jq -e 'any(.[]; .bucket == "fail" or .bucket == "cancel")' > /dev/null; then
+            echo "PR #$pr has failing checks; removing ci-passed"
+            gh pr edit "$pr" --remove-label ci-passed || true
+            exit 0
+          fi
+
+          if echo "$checks" | jq -e 'any(.[]; .bucket == "pending")' > /dev/null; then
+            echo "PR #$pr still has pending checks; leaving the label untouched"
+            exit 0
+          fi
+
+          echo "every check on PR #$pr passed; adding ci-passed"
+          gh pr edit "$pr" --add-label ci-passed
