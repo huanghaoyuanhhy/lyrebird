@@ -205,6 +205,14 @@ func TestTranslate(t *testing.T) {
 			expr: `(status == "a") or (status == "b")`,
 		},
 		{
+			// Lucene draws candidates from the should union when no must/filter
+			// exists, so an explicit 0 still means "one should must match".
+			name: "explicit msm 0 over should-only still requires one match",
+			body: `{"query": {"bool": {"should": [{"term": {"status": "a"}}], "minimum_should_match": 0}}}`,
+			want: basePlan(),
+			expr: `status == "a"`,
+		},
+		{
 			name: "should next to must is optional and drops out",
 			body: `{"query": {"bool": {"must": [{"term": {"views": 1}}], "should": [{"term": {"status": "a"}}]}}}`,
 			want: basePlan(),

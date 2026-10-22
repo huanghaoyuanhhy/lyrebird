@@ -17,9 +17,10 @@ type (
 	boolQuery struct {
 		must, filter, should, mustNot []queryNode
 		// minShouldMatch is resolved at parse time from the query as written
-		// (ES fixes the default before any rewriting): 1 when should is the
-		// only constraint, 0 otherwise. fold() must not recompute it from the
-		// surviving clauses. 0 means should clauses are optional.
+		// (ES fixes the effective value before any rewriting): 1 whenever
+		// should is the only constraint — even an explicit 0 — and 0
+		// otherwise. fold() must not recompute it from surviving clauses;
+		// 0 means should clauses are optional.
 		minShouldMatch int
 	}
 	termQuery struct {
@@ -154,7 +155,6 @@ func parseBool(body json.RawMessage) (queryNode, error) {
 		return nil, err
 	}
 	b := boolQuery{}
-	msmSet := false
 	for k, v := range obj {
 		switch k {
 		case "must", "filter", "should", "must_not":
@@ -181,17 +181,19 @@ func parseBool(body json.RawMessage) (queryNode, error) {
 			if err != nil || n < 0 {
 				return nil, parseErrf("[bool] minimum_should_match must be a non-negative integer")
 			}
-			b.minShouldMatch, msmSet = n, true
+			b.minShouldMatch = n
 		case "boost", "_name", "adjust_pure_negative":
 			// no scoring in Phase 1; cosmetic
 		default:
 			return nil, parseErrf("[bool] unknown parameter [%s]", k)
 		}
 	}
-	// ES's default is syntactic: it depends on the clauses written, not on
-	// those that survive folding, so a must/filter holding only match_all
-	// still suppresses the default. Pin it here, before fold() runs.
-	if !msmSet && len(b.should) > 0 && len(b.must) == 0 && len(b.filter) == 0 {
+	// ES's effective minimum_should_match is syntactic, fixed from the query
+	// as written: should clauses with no must/filter always need at least one
+	// match — even an explicit 0, because Lucene draws candidates from the
+	// should union. A must/filter holding only match_all still counts as
+	// present, so pin the value here, before fold() drops it.
+	if len(b.should) > 0 && len(b.must) == 0 && len(b.filter) == 0 && b.minShouldMatch < 1 {
 		b.minShouldMatch = 1
 	}
 	return b, nil
@@ -398,7 +400,7 @@ func parseExists(body json.RawMessage) (queryNode, error) {
 //   - match_none anywhere in must/filter kills the bool;
 //   - match_all in must_not kills it too (NOT everything = nothing);
 //   - match_all leaves in must/filter drop out;
-//   - a match_all in should satisfies minimum_should_match outright;
+//   - a match_all in should satisfies a single-clause minimum_should_match;
 //   - minimum_should_match above the surviving should count matches nothing.
 //
 // minimum_should_match is pinned by parseBool from the query as written;

@@ -97,6 +97,8 @@ func TestEsserverParity(t *testing.T) {
 			`{"query":{"bool":{"must":[{"match_all":{}}],"should":[{"match_none":{}}]}}}`, false, false},
 		{"msm explicit 1 requires the should even over match_all", milvustest.Collection,
 			`{"query":{"bool":{"must":[{"match_all":{}}],"should":[{"term":{"name":"bravo"}}],"minimum_should_match":1}}}`, false, false},
+		{"msm explicit 0 over should-only still requires one match", milvustest.Collection,
+			`{"query":{"bool":{"should":[{"term":{"name":"bravo"}}],"minimum_should_match":0}}}`, false, false},
 	}
 
 	for _, tc := range cases {
