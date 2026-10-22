@@ -421,6 +421,10 @@ func TestParseAndPlanErrors(t *testing.T) {
 		// beyond the subset (0A000)
 		{name: "write statement", sql: `UPDATE items SET status = 'x'`, wantType: "0A000", wantReason: "only SELECT"},
 		{name: "insert statement", sql: `INSERT INTO items VALUES (1)`, wantType: "0A000", wantReason: "only SELECT"},
+		{name: "create table", sql: `CREATE TABLE items (id bigint)`, wantType: "0A000", wantReason: "DDL"},
+		{name: "alter table", sql: `ALTER TABLE items ADD COLUMN extra text`, wantType: "0A000", wantReason: "DDL"},
+		{name: "drop table", sql: `DROP TABLE items`, wantType: "0A000", wantReason: "DDL"},
+		{name: "truncate", sql: `TRUNCATE items`, wantType: "0A000", wantReason: "DDL"},
 		{name: "distinct", sql: `SELECT DISTINCT status FROM items LIMIT 1`, wantType: "0A000", wantReason: "DISTINCT"},
 		{name: "aggregate projection", sql: `SELECT count(*) FROM items LIMIT 1`, wantType: "0A000", wantReason: "count"},
 		{name: "expression projection", sql: `SELECT views + 1 FROM items LIMIT 1`, wantType: "0A000", wantReason: "expression"},

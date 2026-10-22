@@ -104,8 +104,10 @@ func Parse(sql string) (*Select, error) {
 	}
 	if first.text == "SELECT" {
 		p.advance()
+	} else if schemaStatements[first.text] {
+		return nil, unsupportedErrf("[%s] changes schema: lyrebird creates collections through its control plane, not through SQL DDL (create-table mapping is Phase 3b)", first.text)
 	} else {
-		return nil, unsupportedErrf("only SELECT statements are supported; [%s] is beyond lyrebird's read path (DDL mapping is Phase 3)", first.text)
+		return nil, unsupportedErrf("only SELECT statements are supported; [%s] is beyond lyrebird's read path", first.text)
 	}
 
 	sel, err := p.parseSelect()
@@ -157,6 +159,15 @@ var unsupportedClauses = map[string]bool{
 	"GROUP": true, "HAVING": true, "WINDOW": true,
 	"UNION": true, "INTERSECT": true, "EXCEPT": true,
 	"FOR": true, "FETCH": true, "INTO": true,
+}
+
+// schemaStatements are the statement heads that change a table's shape.
+// They get their own message: clients probe with DDL at connect time, and
+// calling it "not a SELECT" would hide that the collection comes from the
+// control plane. TRUNCATE rides along — it is a data-wipe statement with
+// schema-change consequences for every reader.
+var schemaStatements = map[string]bool{
+	"CREATE": true, "ALTER": true, "DROP": true, "TRUNCATE": true,
 }
 
 // Columns resolves the projected column list: the named columns in written
