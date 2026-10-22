@@ -7,12 +7,13 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+  # main's branch protection requires this check on every pull request, so
+  # the PR trigger must not be path-filtered: a skipped workflow reports no
+  # status and would leave docs-only PRs blocked forever. Push to main stays
+  # filtered, since those runs are informational.
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   workflow_dispatch:
 
 env:
