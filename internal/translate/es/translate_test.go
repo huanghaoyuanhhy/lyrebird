@@ -205,6 +205,14 @@ func TestTranslate(t *testing.T) {
 			expr: `(status == "a") or (status == "b")`,
 		},
 		{
+			// Lucene draws candidates from the should union when no must/filter
+			// exists, so an explicit 0 still means "one should must match".
+			name: "explicit msm 0 over should-only still requires one match",
+			body: `{"query": {"bool": {"should": [{"term": {"status": "a"}}], "minimum_should_match": 0}}}`,
+			want: basePlan(),
+			expr: `status == "a"`,
+		},
+		{
 			name: "should next to must is optional and drops out",
 			body: `{"query": {"bool": {"must": [{"term": {"views": 1}}], "should": [{"term": {"status": "a"}}]}}}`,
 			want: basePlan(),
@@ -221,6 +229,36 @@ func TestTranslate(t *testing.T) {
 			body: `{"query": {"bool": {"must": [{"match_all": {}}, {"term": {"views": 1}}]}}}`,
 			want: basePlan(),
 			expr: `views == 1`,
+		},
+		{
+			// ES pins the default msm from the clauses as written; a must that
+			// holds only match_all still counts, so the should stays optional.
+			name: "match_all in must keeps the default msm at 0",
+			body: `{"query": {"bool": {"must": [{"match_all": {}}], "should": [{"term": {"status": "a"}}]}}}`,
+			want: basePlan(),
+		},
+		{
+			name: "match_all in filter keeps the default msm at 0",
+			body: `{"query": {"bool": {"filter": [{"match_all": {}}], "should": [{"term": {"status": "a"}}]}}}`,
+			want: basePlan(),
+		},
+		{
+			name: "default msm keeps an impossible should harmless next to match_all",
+			body: `{"query": {"bool": {"must": [{"match_all": {}}], "should": [{"match_none": {}}]}}}`,
+			want: basePlan(),
+		},
+		{
+			name: "explicit msm 1 requires the should even over match_all",
+			body: `{"query": {"bool": {"must": [{"match_all": {}}], "should": [{"term": {"status": "a"}}], "minimum_should_match": 1}}}`,
+			want: basePlan(),
+			expr: `status == "a"`,
+		},
+		{
+			// must_not is not must/filter: it leaves the should-only default in place.
+			name: "must_not does not suppress the default msm",
+			body: `{"query": {"bool": {"must_not": [{"term": {"status": "deleted"}}], "should": [{"term": {"status": "a"}}]}}}`,
+			want: basePlan(),
+			expr: `(status == "a") and (not (status == "deleted"))`,
 		},
 		{
 			name: "empty bool matches all",
@@ -240,6 +278,12 @@ func TestTranslate(t *testing.T) {
 		{
 			name: "msm above the should count matches nothing",
 			body: `{"query": {"bool": {"should": [{"term": {"status": "a"}}], "minimum_should_match": 2}}}`,
+			want: baseNoMatch(),
+		},
+		{
+			// match_all counts as one matching clause, not as a free pass for msm.
+			name: "msm above the should count counts match_all once",
+			body: `{"query": {"bool": {"should": [{"match_all": {}}], "minimum_should_match": 2}}}`,
 			want: baseNoMatch(),
 		},
 		{
@@ -645,6 +689,12 @@ func TestTranslateErrors(t *testing.T) {
 		{
 			name:       "minimum_should_match between 2 and count unsupported",
 			body:       `{"query": {"bool": {"should": [{"term": {"status": "a"}}, {"term": {"status": "b"}}, {"term": {"status": "c"}}], "minimum_should_match": 2}}}`,
+			wantType:   "unsupported_exception",
+			wantReason: "minimum_should_match > 1",
+		},
+		{
+			name:       "minimum_should_match above 1 with match_all in should is still k-of-n",
+			body:       `{"query": {"bool": {"should": [{"match_all": {}}, {"term": {"status": "a"}}], "minimum_should_match": 2}}}`,
 			wantType:   "unsupported_exception",
 			wantReason: "minimum_should_match > 1",
 		},

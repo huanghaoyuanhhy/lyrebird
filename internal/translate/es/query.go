@@ -16,8 +16,12 @@ type (
 	matchNone struct{}
 	boolQuery struct {
 		must, filter, should, mustNot []queryNode
-		minShouldMatch                int
-		minShouldMatchSet             bool
+		// minShouldMatch is resolved at parse time from the query as written
+		// (ES fixes the effective value before any rewriting): 1 whenever
+		// should is the only constraint — even an explicit 0 — and 0
+		// otherwise. fold() must not recompute it from surviving clauses;
+		// 0 means should clauses are optional.
+		minShouldMatch int
 	}
 	termQuery struct {
 		field string
@@ -177,12 +181,20 @@ func parseBool(body json.RawMessage) (queryNode, error) {
 			if err != nil || n < 0 {
 				return nil, parseErrf("[bool] minimum_should_match must be a non-negative integer")
 			}
-			b.minShouldMatch, b.minShouldMatchSet = n, true
+			b.minShouldMatch = n
 		case "boost", "_name", "adjust_pure_negative":
 			// no scoring in Phase 1; cosmetic
 		default:
 			return nil, parseErrf("[bool] unknown parameter [%s]", k)
 		}
+	}
+	// ES's effective minimum_should_match is syntactic, fixed from the query
+	// as written: should clauses with no must/filter always need at least one
+	// match — even an explicit 0, because Lucene draws candidates from the
+	// should union. A must/filter holding only match_all still counts as
+	// present, so pin the value here, before fold() drops it.
+	if len(b.should) > 0 && len(b.must) == 0 && len(b.filter) == 0 && b.minShouldMatch < 1 {
+		b.minShouldMatch = 1
 	}
 	return b, nil
 }
@@ -388,8 +400,11 @@ func parseExists(body json.RawMessage) (queryNode, error) {
 //   - match_none anywhere in must/filter kills the bool;
 //   - match_all in must_not kills it too (NOT everything = nothing);
 //   - match_all leaves in must/filter drop out;
-//   - a match_all in should satisfies minimum_should_match outright;
+//   - a match_all in should satisfies a single-clause minimum_should_match;
 //   - minimum_should_match above the surviving should count matches nothing.
+//
+// minimum_should_match is pinned by parseBool from the query as written;
+// folding removes clauses but never re-derives the default from what is left.
 func fold(n queryNode) (queryNode, error) {
 	b, ok := n.(boolQuery)
 	if !ok {
@@ -414,17 +429,11 @@ func fold(n queryNode) (queryNode, error) {
 	b.filter = dropWhere(b.filter, isMatchAll)
 	b.mustNot = dropWhere(b.mustNot, isMatchNone)
 
-	// effective minimum_should_match; ES default is 1 when should is the
-	// only constraint present, 0 otherwise
-	msm := 0
-	if b.minShouldMatchSet {
-		msm = b.minShouldMatch
-	} else if len(b.must) == 0 && len(b.filter) == 0 {
-		msm = 1
-	}
-
-	if containsWhere(b.should, isMatchAll) && msm >= 1 {
-		b.should = nil // the OR block is satisfied unconditionally
+	// minimum_should_match was pinned at parse time against the query as
+	// written; a must/filter that folds away does not revive the default.
+	msm := b.minShouldMatch
+	if containsWhere(b.should, isMatchAll) && msm == 1 {
+		b.should = nil // one clause matches unconditionally and msm is 1
 	} else {
 		hadNone := containsWhere(b.should, isMatchNone)
 		b.should = dropWhere(b.should, isMatchNone)

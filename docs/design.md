@@ -95,6 +95,11 @@
 - `_source` wildcards: exact names and `prefix.*` only; other patterns fail fast.
 - from+size capped at 10000 like ES `max_result_window` — the store will fetch
   offset+size and sort client-side within that window.
+- `bool`'s default `minimum_should_match` is **pinned at parse time** from the query as
+  written — 1 when `should` is the only constraint, 0 when `must`/`filter` is present.
+  ES's rule is syntactic (a `must` holding only `match_all` still counts), so the later
+  fold that drops boolean identities must not re-derive the default from what survives.
+  `match_all` inside `should` counts as one matching clause, not a free pass for `msm`.
 - Known approximations (documented in code): match tokenization is whitespace-only until
   Phase 5; `minimum_should_match > 1` needs k-of-n matching, unsupported for now.
 
