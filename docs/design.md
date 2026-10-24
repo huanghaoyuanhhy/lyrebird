@@ -127,6 +127,18 @@ re-confirmed by the e2e suite now running on `client/v2` v2.6.5:
   `is not null` work on nullable and non-nullable fields alike — verified
   against a fixture with a nullable column (null side included), so the
   `exists` mapping holds both ways.
+- **Negation is three-valued aware (bool-cartesian-proven, 2026-10-25).**
+  Milvus's `not` is Kleene: over a null field the inner verdict is unknown
+  and the row is dropped, while Elasticsearch counts a missing field as
+  "did not match", so `must_not` must keep it. The must_not complement
+  therefore never renders bare `not (...)` over a nullable field: it rides
+  `field is null or not (...)`, swaps the total null-check operators, and
+  De Morgans through and/or so nested bools compose the same way. This
+  needs field nullability, which `Schema` carries through the optional
+  `NullableSchema` extension (absent extension = nothing is nullable =
+  conservative status quo). Parity matrix: internal/esserver
+  TestEsserverParityBoolMatrix — 88 shapes against reference ES; its first
+  run (32 reds) was exactly this family.
 - Query results always include the primary key column, requested or not.
 - Offset past the total returns zero rows (ES-compatible), not an error.
 - **SDK: `milvus-io/milvus/client/v2` v2.6.5** (settled 2026-09-15). Started

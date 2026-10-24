@@ -79,13 +79,16 @@ func (e *MilvusExecutor) Schema(ctx context.Context, collection string) (transla
 		return nil, err
 	}
 	funcOutputs := functionOutputFields(coll.Schema)
-	schema := collectionSchema{types: translate.MapSchema{}}
+	schema := collectionSchema{types: translate.MapSchema{}, nulls: map[string]bool{}}
 	for _, f := range coll.Schema.Fields {
 		if isFunctionOutput(f.Name, funcOutputs) {
 			continue // Milvus refuses to return their raw data (see buildProjection)
 		}
 		schema.names = append(schema.names, f.Name)
 		schema.types[f.Name] = translateFieldType(f)
+		if f.Nullable {
+			schema.nulls[f.Name] = true
+		}
 	}
 	return schema, nil
 }
@@ -96,10 +99,17 @@ func (e *MilvusExecutor) Schema(ctx context.Context, collection string) (transla
 type collectionSchema struct {
 	names []string
 	types translate.MapSchema
+	nulls map[string]bool
 }
 
 func (s collectionSchema) FieldType(field string) translate.FieldType {
 	return s.types.FieldType(field)
+}
+
+// Nullable implements translate.NullableSchema from the collection's own
+// field declarations.
+func (s collectionSchema) Nullable(field string) bool {
+	return s.nulls[field]
 }
 
 // Fields implements translate.Schema, in storage order.

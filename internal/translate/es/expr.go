@@ -101,19 +101,12 @@ func boolExpr(b boolQuery, schema translate.Schema) (translate.Expr, error) {
 	}
 
 	for _, c := range b.mustNot {
-		// A negated exists is an IS NULL: routing it through Not would
-		// render `not (x is not null)`, which Milvus's three-valued `not`
-		// mis-filters (docs/design.md).
-		if ex, ok := c.(existsQuery); ok {
-			children = append(children, translate.IsNull{Field: ex.field})
-			continue
-		}
 		e, err := buildExpr(c, schema)
 		if err != nil {
 			return nil, err
 		}
 		if e != nil {
-			children = append(children, translate.Not{Child: e})
+			children = append(children, negated(e, schema))
 		}
 	}
 
@@ -125,6 +118,74 @@ func boolExpr(b boolQuery, schema translate.Schema) (translate.Expr, error) {
 	default:
 		return translate.And{Children: children}, nil
 	}
+}
+
+// negated complements one must_not clause under Milvus's three-valued
+// logic. Elasticsearch asks only "did the clause match" — a doc missing the
+// field does not match, so NOT must keep it — while `not (...)` over a null
+// field evaluates to unknown and the row is silently dropped. Wherever the
+// clause can come out unknown (a comparison on a nullable field), the
+// complement rides `field is null or not (...)`; the null checks are total
+// predicates and swap operators instead. De Morgan carries the recursion
+// through and/or, so a nested bool inside must_not composes the same way,
+// and a double negation is the identity, unknown included.
+func negated(e translate.Expr, schema translate.Schema) translate.Expr {
+	switch n := e.(type) {
+	case translate.NotNull:
+		return translate.IsNull{Field: n.Field}
+	case translate.IsNull:
+		return translate.NotNull{Field: n.Field}
+	case translate.Not:
+		return n.Child
+	case translate.And:
+		if len(n.Children) == 0 { // renders as match-all; its complement is nothing
+			return translate.Never{}
+		}
+		kids := make([]translate.Expr, len(n.Children))
+		for i, c := range n.Children {
+			kids[i] = negated(c, schema)
+		}
+		return translate.Or{Children: kids}
+	case translate.Or:
+		if len(n.Children) == 0 {
+			return translate.Never{}
+		}
+		kids := make([]translate.Expr, len(n.Children))
+		for i, c := range n.Children {
+			kids[i] = negated(c, schema)
+		}
+		return translate.And{Children: kids}
+	default:
+		if f := fieldOf(e); f != "" && nullableField(schema, f) {
+			return translate.Or{Children: []translate.Expr{
+				translate.IsNull{Field: f},
+				translate.Not{Child: e},
+			}}
+		}
+	}
+	return translate.Not{Child: e}
+}
+
+// fieldOf reports the one field a comparison leaf references, "" for nodes
+// without a field (constants and composites).
+func fieldOf(e translate.Expr) string {
+	switch n := e.(type) {
+	case translate.Compare:
+		return n.Field
+	case translate.InList:
+		return n.Field
+	case translate.TextMatch:
+		return n.Field
+	}
+	return ""
+}
+
+// nullableField asks the schema whether the field admits nulls; a schema
+// without the NullableSchema extension reports nothing, keeping the plain
+// `not (...)` rendering.
+func nullableField(schema translate.Schema, field string) bool {
+	ns, ok := schema.(translate.NullableSchema)
+	return ok && ns.Nullable(field)
 }
 
 // matchExpr maps ES match onto Milvus capabilities: token match on analyzed
