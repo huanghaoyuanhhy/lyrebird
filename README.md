@@ -161,6 +161,12 @@ The e2e suites skip unless configured, so credentials stay out of the repo:
 - `LYREBIRD_TEST_PG_DSN` — a real Postgres with pgvector; the PG parity
   suite replays the same SQL against both and compares columns and rows.
 
+The DDL suites (`TestPgserverDDLE2E`, `TestEsserverDDLE2E`) use the same
+reference Postgres/Elasticsearch as a syntax oracle: they prove schema
+statements (CREATE/ALTER/DROP/TRUNCATE, index create/delete/mapping) are
+real DDL there, then pin that the gateway refuses them by name and leaves
+the live collection or index untouched.
+
 `make e2e` boots all three stacks (`docker-compose.e2e.yml`: Milvus
 standalone, Elasticsearch 8.x, Postgres+pgvector), seeds the same fixtures
 into each, and runs everything; the `E2E` GitHub Actions workflow runs the

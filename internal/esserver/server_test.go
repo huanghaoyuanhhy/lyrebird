@@ -425,6 +425,42 @@ func TestSearchRoutesAndParams(t *testing.T) {
 	})
 }
 
+// TestDDLRoutesRefuseByName asserts index-level DDL answers with the
+// capability's name instead of falling through to the 404 catch-all, and
+// that nothing reaches the store on the way.
+func TestDDLRoutesRefuseByName(t *testing.T) {
+	exec := &fakeExecutor{}
+	srv := serve(t, exec)
+
+	cases := []struct{ name, method, path, body string }{
+		{"index creation", http.MethodPut, "/products",
+			`{"mappings":{"properties":{"name":{"type":"keyword"}}}}`},
+		{"index deletion", http.MethodDelete, "/products", ""},
+		{"mapping update", http.MethodPut, "/products/_mapping",
+			`{"properties":{"extra":{"type":"keyword"}}}`},
+		{"settings update", http.MethodPut, "/products/_settings",
+			`{"index":{"number_of_replicas":1}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := searchRequest(t, srv, tc.method, tc.path, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %v", status, body)
+			}
+			e := body["error"].(map[string]any)
+			if e["type"] != "unsupported_exception" {
+				t.Errorf("error.type = %v, want unsupported_exception", e["type"])
+			}
+			if reason, _ := e["reason"].(string); !strings.Contains(reason, "control plane") {
+				t.Errorf("reason = %q, want the control-plane explanation", reason)
+			}
+			if exec.gotPlan != nil {
+				t.Errorf("DDL reached the store: plan = %v", exec.gotPlan)
+			}
+		})
+	}
+}
+
 func TestClusterInfoKeepsProductHeader(t *testing.T) {
 	srv := serve(t, &fakeExecutor{})
 	resp, err := srv.Client().Get(srv.URL + "/")

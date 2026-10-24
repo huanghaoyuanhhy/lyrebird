@@ -42,8 +42,10 @@
 //
 // Fail-fast class: valid SQL beyond the subset returns 0A000
 // (feature_not_supported) naming the member — GROUP BY, aggregates, LIKE,
-// casts, query parameters, WHERE-distance predicates. The L1 operator <+>
-// has no Milvus metric and stays rejected in every position.
+// casts, query parameters, WHERE-distance predicates. Schema statements
+// (CREATE/ALTER/DROP/TRUNCATE) get a DDL-specific message: collections come
+// from the control plane, not from SQL. The L1 operator <+> has no Milvus
+// metric and stays rejected in every position.
 //
 // Mapping notes (see docs/design.md):
 //
