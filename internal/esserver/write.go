@@ -24,10 +24,11 @@ import (
 )
 
 // installWriteRoutes registers the document write APIs: the index API
-// (PUT/POST _doc, _create) and the partial-update API (_update). All of
-// them run the strict write path: a document that does not match the
-// index's live mapping is rejected, never coerced, never dynamically
-// mapped (docs/design.md, write path).
+// (PUT/POST _doc, _create), the partial-update API (_update), and the
+// delete APIs (DELETE _doc/{id}, _delete_by_query). All of them run the
+// strict write path: a document that does not match the index's live
+// mapping is rejected, never coerced, never dynamically mapped
+// (docs/design.md, write path).
 func (s *Server) installWriteRoutes() {
 	s.mux.HandleFunc("PUT /{index}/_doc", s.indexDocument)
 	s.mux.HandleFunc("POST /{index}/_doc", s.indexDocument)
@@ -37,6 +38,8 @@ func (s *Server) installWriteRoutes() {
 	s.mux.HandleFunc("POST /{index}/_create/{id}", s.createDocument)
 	s.mux.HandleFunc("PUT /{index}/_update/{id}", s.updateDocument)
 	s.mux.HandleFunc("POST /{index}/_update/{id}", s.updateDocument)
+	s.mux.HandleFunc("DELETE /{index}/_doc/{id}", s.deleteDocument)
+	s.mux.HandleFunc("POST /{index}/_delete_by_query", s.deleteByQuery)
 
 	// _bulk would batch the same calls, but its ndjson envelope deserves
 	// its own pass; fail with the name rather than a 404.
@@ -228,6 +231,194 @@ func (s *Server) updateDocument(w http.ResponseWriter, r *http.Request) {
 		zap.String("result", result),
 		zap.Duration("took", time.Since(start)))
 	writeIndexResponse(w, index, id, result)
+}
+
+// deleteDocument handles DELETE /{index}/_doc/{id}: remove the row the
+// primary key addresses. A missing document is a 404 with result
+// not_found (the ES default — deletes are not upserts).
+func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
+	logger := s.zapLogger()
+	index := r.PathValue("index")
+	id := r.PathValue("id")
+	start := time.Now()
+
+	meta, err := s.cluster.Collection(r.Context(), "", index)
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	pk := primaryKeyOf(meta)
+	parsed, err := parseDocumentID(pk, id)
+	if err != nil {
+		s.writeRequestError(logger, w, err, index)
+		return
+	}
+	if _, exists, err := s.fetchDocument(r, index, pk, pkValue(pk, parsed)); err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	} else if !exists {
+		writeDeleteResponse(w, index, id, "not_found")
+		return
+	}
+	result, err := s.cluster.Delete(r.Context(), index, []any{parsed})
+	if err != nil {
+		logger.Error("delete execution failed", zap.String("index", index), zap.Error(err))
+		s.writeWriteError(logger, w, err, index)
+		return
+	}
+	logger.Info("es delete",
+		zap.String("index", index),
+		zap.String("id", id),
+		zap.Int64("deleted", result.Count),
+		zap.Duration("took", time.Since(start)))
+	writeDeleteResponse(w, index, id, "deleted")
+}
+
+// writeDeleteResponse emits the DELETE /_doc/{id} envelope: 200 with
+// result=deleted, 404 with result=not_found.
+func writeDeleteResponse(w http.ResponseWriter, index, id, result string) {
+	status := http.StatusOK
+	if result == "not_found" {
+		status = http.StatusNotFound
+	}
+	writeJSON(w, status, map[string]any{
+		"_index":        index,
+		"_id":           id,
+		"_version":      1,
+		"result":        result,
+		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"_seq_no":       0,
+		"_primary_term": 1,
+		"status":        status,
+	})
+}
+
+// deleteByQuery handles POST /{index}/_delete_by_query: translate the query
+// DSL, fetch the matched rows' primary keys (the fetch narrows to the key,
+// bounded by the write window), and delete by key. A query that matches
+// every row refuses — the same boundary a PG DELETE without WHERE hits.
+func (s *Server) deleteByQuery(w http.ResponseWriter, r *http.Request) {
+	logger := s.zapLogger()
+	index := r.PathValue("index")
+	start := time.Now()
+
+	if err := rejectDeleteParams(r); err != nil {
+		writeUnsupported(w, err.Error())
+		return
+	}
+	body, err := requestBody(r)
+	if err != nil {
+		writeUnsupported(w, err.Error())
+		return
+	}
+	var top map[string]json.RawMessage
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&top); err != nil {
+		writeErrorEnvelope(w, http.StatusBadRequest, "parsing_exception",
+			"the _delete_by_query body is not valid JSON: "+err.Error(), index)
+		return
+	}
+	qraw, ok := top["query"]
+	if !ok {
+		writeErrorEnvelope(w, http.StatusBadRequest, "parsing_exception",
+			"the _delete_by_query body needs a [query] member naming the documents to delete", index)
+		return
+	}
+
+	schema, err := s.cluster.Schema(r.Context(), index)
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	// the query member rides the search translator: wrap it in the search
+	// body shape the translator reads
+	wrapper, err := json.Marshal(map[string]json.RawMessage{"query": qraw})
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	plan, err := es.Translate(wrapper, schema)
+	if err != nil {
+		s.writeTranslateError(logger, w, err)
+		return
+	}
+	if plan.Search != nil {
+		writeUnsupported(w, "a vector search as the _delete_by_query query")
+		return
+	}
+	if plan.Expr == nil && !plan.NoMatch {
+		writeUnsupported(w, "a query that matches every document (send a query naming the documents to delete)")
+		return
+	}
+
+	meta, err := s.cluster.Collection(r.Context(), "", index)
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	pk := primaryKeyOf(meta)
+	if pk.Name == "" {
+		writeErrorEnvelope(w, http.StatusInternalServerError, "internal_error_exception",
+			"index "+index+" has no primary key field", index)
+		return
+	}
+	plan.Limit = store.WriteScanLimit
+	plan.Offset = 0
+	plan.Source = translate.SourceFilter{FetchSource: true, Includes: []string{pk.Name}}
+	matched, err := s.cluster.Search(r.Context(), index, plan)
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	if matched.Total > store.WriteScanLimit {
+		writeErrorEnvelope(w, http.StatusBadRequest, "unsupported_exception",
+			fmt.Sprintf("the query matched %d documents, beyond the %d-document write window: narrow it",
+				matched.Total, store.WriteScanLimit), index)
+		return
+	}
+
+	pks := make([]any, 0, len(matched.Hits))
+	for _, hit := range matched.Hits {
+		pks = append(pks, hit.Source[pk.Name])
+	}
+	result, err := s.cluster.Delete(r.Context(), index, pks)
+	if err != nil {
+		logger.Error("delete_by_query execution failed", zap.String("index", index), zap.Error(err))
+		s.writeWriteError(logger, w, err, index)
+		return
+	}
+	logger.Info("es delete_by_query",
+		zap.String("index", index),
+		zap.Int64("matched", matched.Total),
+		zap.Int64("deleted", result.Count),
+		zap.Duration("took", time.Since(start)))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"took":                   time.Since(start).Milliseconds(),
+		"timed_out":              false,
+		"total":                  matched.Total,
+		"deleted":                result.Count,
+		"batches":                1,
+		"version_conflicts":      0,
+		"noops":                  0,
+		"retries":                map[string]any{"bulk": 0, "search": 0},
+		"throttled_millis":       0,
+		"requests_per_second":    -1.0,
+		"throttled_until_millis": 0,
+		"failures":               []any{},
+	})
+}
+
+// rejectDeleteParams refuses the _delete_by_query parameters whose silence
+// would lie: batching and throttling promise a progress shape the
+// synchronous delete does not have. refresh/conflicts/wait_for_completion
+// are accepted and ignored — they shape timing, not semantics here.
+func rejectDeleteParams(r *http.Request) error {
+	q := r.URL.Query()
+	for _, p := range []string{"max_docs", "scroll", "slices", "requests_per_second"} {
+		if q.Has(p) {
+			return fmt.Errorf("the %s parameter (batched or bounded deletion)", p)
+		}
+	}
+	return nil
 }
 
 // parseDocumentID turns the URL id into the primary key's storage shape:

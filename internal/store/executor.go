@@ -36,6 +36,13 @@ type Executor interface {
 
 	// Upsert writes rows by primary key, replacing each stored row whole.
 	Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (WriteResult, error)
+
+	// Delete removes the rows with the given primary keys, in storage
+	// encoding (string for a VarChar key, int64 for a numeric one). The
+	// callers find the keys with a filtered search first — the same
+	// read-modify-write shape UPDATE uses — so the affected rows are known
+	// before anything is sent.
+	Delete(ctx context.Context, collection string, pks []any) (WriteResult, error)
 }
 
 // Hit is one matched entity: its primary key and the fields fetched for it.
@@ -120,6 +127,17 @@ func (e *LogExecutor) Upsert(ctx context.Context, collection string, rows []tran
 	logger.Info("store: upsert (log executor)",
 		zap.String("collection", collection), zap.Int("rows", len(rows)))
 	return WriteResult{Count: int64(len(rows))}, nil
+}
+
+// Delete implements Executor: the stand-in removes nothing, logging the keys.
+func (e *LogExecutor) Delete(ctx context.Context, collection string, pks []any) (WriteResult, error) {
+	logger := e.Logger
+	if logger == nil {
+		logger = zap.L()
+	}
+	logger.Info("store: delete (log executor)",
+		zap.String("collection", collection), zap.Int("keys", len(pks)))
+	return WriteResult{Count: int64(len(pks))}, nil
 }
 
 // Search implements Executor. Render errors are returned, not swallowed:

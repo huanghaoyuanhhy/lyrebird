@@ -301,3 +301,99 @@ func TestBulkRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteDocumentById(t *testing.T) {
+	exec := &fakeExecutor{
+		metas:  []catalog.CollectionMeta{writeMeta},
+		result: &store.SearchResult{Total: 1, Hits: []store.Hit{{ID: "7", Source: map[string]any{"id": int64(7)}}}},
+	}
+	srv := writeServer(t, exec)
+
+	status, body := doJSON(t, srv, "DELETE", "/items/_doc/7", "")
+	if status != http.StatusOK || body["result"] != "deleted" || body["_id"] != "7" {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 || exec.deleteCalls[0].Collection != "items" {
+		t.Fatalf("delete calls = %#v", exec.deleteCalls)
+	}
+	if pks := exec.deleteCalls[0].PKs; len(pks) != 1 || pks[0] != int64(7) {
+		t.Fatalf("pks = %#v, want the storage-encoded key", pks)
+	}
+
+	// a missing document answers 404 not_found, and deletes nothing
+	exec.result = &store.SearchResult{}
+	status, body = doJSON(t, srv, "DELETE", "/items/_doc/999", "")
+	if status != http.StatusNotFound || body["result"] != "not_found" {
+		t.Fatalf("missing status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatalf("missing doc ran a delete: %#v", exec.deleteCalls)
+	}
+
+	// a non-numeric id for a numeric key is a 400
+	status, body = doJSON(t, srv, "DELETE", "/items/_doc/notanumber", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("bad id status=%d body=%v", status, body)
+	}
+
+	// a missing index is a native 404
+	status, _ = doJSON(t, srv, "DELETE", "/ghost/_doc/1", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("ghost index status=%d", status)
+	}
+}
+
+func TestDeleteByQueryDeletesMatchedKeys(t *testing.T) {
+	exec := &fakeExecutor{
+		metas:  []catalog.CollectionMeta{writeMeta},
+		schema: translate.MapSchema{"id": translate.TypeNumber, "name": translate.TypeKeyword, "price": translate.TypeNumber},
+		result: &store.SearchResult{Total: 2, Hits: []store.Hit{
+			{ID: "1", Source: map[string]any{"id": int64(1)}},
+			{ID: "2", Source: map[string]any{"id": int64(2)}},
+		}},
+	}
+	srv := writeServer(t, exec)
+
+	status, body := doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"range":{"price":{"lt":3}}}}`)
+	if status != http.StatusOK || body["total"] != float64(2) || body["deleted"] != float64(2) {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatalf("delete calls = %d", len(exec.deleteCalls))
+	}
+	if pks := exec.deleteCalls[0].PKs; len(pks) != 2 || pks[0] != int64(1) || pks[1] != int64(2) {
+		t.Fatalf("pks = %#v", pks)
+	}
+	// the scan narrows to the primary key, bounded by the write window
+	if inc := exec.gotPlan.Source.Includes; len(inc) != 1 || inc[0] != "id" {
+		t.Fatalf("fetch = %v, want only the primary key", inc)
+	}
+	if exec.gotPlan.Limit != store.WriteScanLimit {
+		t.Fatalf("limit = %d, want the write window", exec.gotPlan.Limit)
+	}
+
+	// a query matching every document refuses, like a PG DELETE without WHERE
+	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"match_all":{}}}`)
+	if status != http.StatusBadRequest || body["error"].(map[string]any)["type"] != "unsupported_exception" {
+		t.Fatalf("match_all status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatalf("match_all ran a delete: %#v", exec.deleteCalls)
+	}
+
+	// a body without a query member is a parse error
+	status, _ = doJSON(t, srv, "POST", "/items/_delete_by_query", `{}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("no query status=%d", status)
+	}
+
+	// matches beyond the write window refuse before anything is deleted
+	exec.result = &store.SearchResult{Total: store.WriteScanLimit + 1}
+	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"range":{"price":{"lt":3}}}}`)
+	if status != http.StatusBadRequest || body["error"].(map[string]any)["type"] != "unsupported_exception" {
+		t.Fatalf("over-window status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatal("over-window ran a delete")
+	}
+}

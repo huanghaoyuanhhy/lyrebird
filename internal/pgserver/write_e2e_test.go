@@ -37,6 +37,28 @@ func waitVisible(t *testing.T, ctx context.Context, conn *pgx.Conn, sql string, 
 	}
 }
 
+// waitGone polls until a query stops finding rows: Milvus delete
+// tombstones ride the same growing-segment visibility window as inserts.
+func waitGone(t *testing.T, ctx context.Context, conn *pgx.Conn, sql string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rows, err := conn.Query(ctx, sql)
+		if err != nil {
+			t.Fatalf("query %q: %v", sql, err)
+		}
+		any := rows.Next()
+		rows.Close()
+		if !any {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rows never left for %q", sql)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // TestPgserverWriteE2E drives INSERT/UPDATE over the real wire: rows land
 // in Milvus, reads see them, strict rejections come back with their
 // SQLSTATE codes.
@@ -113,6 +135,30 @@ func TestPgserverWriteE2E(t *testing.T) {
 		if price != 9.5 {
 			t.Fatalf("price = %v, want 9.5", price)
 		}
+	})
+
+	t.Run("delete removes matched rows only", func(t *testing.T) {
+		tag, err := conn.Exec(ctx,
+			fmt.Sprintf("INSERT INTO %s (id, name, price, active, emb) VALUES (21, 'victim', 1, true, '[1, 1]'), (22, 'survivor', 2, true, '[0, 1]')", table))
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if tag.String() != "INSERT 0 2" {
+			t.Fatalf("insert tag = %q", tag.String())
+		}
+
+		tag, err = conn.Exec(ctx,
+			fmt.Sprintf("DELETE FROM %s WHERE name = 'victim'", table))
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if tag.String() != "DELETE 1" {
+			t.Fatalf("tag = %q, want DELETE 1", tag.String())
+		}
+
+		waitGone(t, ctx, conn, fmt.Sprintf("SELECT 1 FROM %s WHERE id = 21 LIMIT 1", table))
+		waitVisible(t, ctx, conn,
+			fmt.Sprintf("SELECT name FROM %s WHERE id = 22 LIMIT 1", table), new(string))
 	})
 
 	t.Run("insert vector literal and query by distance", func(t *testing.T) {

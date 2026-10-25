@@ -3,6 +3,7 @@ package esserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -83,6 +84,28 @@ func TestEsserverWriteE2E(t *testing.T) {
 			}
 			if time.Now().After(deadline) {
 				t.Fatalf("row %s never became visible; hits = %d", id, len(items))
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	// waitGone polls until a doc id stops being returned by the search
+	// path: Milvus delete tombstones ride the same growing-segment
+	// visibility window as inserts.
+	waitGone := func(index, id string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			status, body := do(t, "POST", "/"+index+"/_search", `{"query":{"term":{"id":`+id+`}}}`)
+			if status != http.StatusOK {
+				t.Fatalf("search status=%d body=%v", status, body)
+			}
+			items := body["hits"].(map[string]any)["hits"].([]any)
+			if len(items) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("doc %s never left; hits = %d", id, len(items))
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
@@ -184,5 +207,38 @@ func TestEsserverWriteE2E(t *testing.T) {
 		if status != http.StatusConflict {
 			t.Fatalf("string pk conflict status=%d body=%v", status, body)
 		}
+	})
+
+	t.Run("delete doc and delete by query", func(t *testing.T) {
+		index := milvustest.WriteCollection
+		for id, price := range map[string]string{"201": "1", "202": "2", "203": "3"} {
+			status, body := do(t, "PUT", "/"+index+"/_doc/"+id,
+				fmt.Sprintf(`{"id": %s, "name": "d%s", "price": %s, "active": true, "emb": [1, 1]}`, id, id, price))
+			if status != http.StatusCreated {
+				t.Fatalf("seed %s: status=%d body=%v", id, status, body)
+			}
+		}
+
+		// delete one document: 200 deleted; a second delete: 404 not_found
+		status, body := do(t, "DELETE", "/"+index+"/_doc/201", "")
+		if status != http.StatusOK || body["result"] != "deleted" {
+			t.Fatalf("delete status=%d body=%v", status, body)
+		}
+		status, body = do(t, "DELETE", "/"+index+"/_doc/201", "")
+		if status != http.StatusNotFound || body["result"] != "not_found" {
+			t.Fatalf("re-delete status=%d body=%v", status, body)
+		}
+
+		// delete the price<3 shape: exactly the remaining doc 202
+		status, body = do(t, "POST", "/"+index+"/_delete_by_query",
+			`{"query":{"range":{"price":{"lt":2.5}}}}`)
+		if status != http.StatusOK || body["total"] != float64(1) || body["deleted"] != float64(1) {
+			t.Fatalf("delete_by_query status=%d body=%v", status, body)
+		}
+
+		// 203 survives, 201 and 202 are gone
+		waitGone(index, "201")
+		waitGone(index, "202")
+		searchOne(t, "203")
 	})
 }

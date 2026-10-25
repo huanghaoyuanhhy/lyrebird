@@ -89,6 +89,82 @@ func (e *MilvusExecutor) Upsert(ctx context.Context, collection string, rows []t
 	return e.write(ctx, collection, rows, true)
 }
 
+// WriteScanLimit bounds how many rows one write statement may touch. The
+// read-modify-write (PG UPDATE) and the delete lanes stream their matches
+// through the same window the read path sorts in, so no write can exceed
+// what a SELECT could fetch; a statement matching more refuses instead of
+// silently touching a prefix.
+const WriteScanLimit = 10000
+
+// Delete removes the rows with the given primary keys. Milvus deletes by a
+// pk-membership expression; the count is the server's answer.
+func (e *MilvusExecutor) Delete(ctx context.Context, collection string, pks []any) (WriteResult, error) {
+	if len(pks) == 0 {
+		return WriteResult{}, nil
+	}
+	coll, err := e.describe(ctx, collection)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	pk := primaryKey(coll.Schema.Fields)
+	if pk == nil {
+		return WriteResult{}, fmt.Errorf("collection %q has no primary key field", collection)
+	}
+
+	opt := milvusclient.NewDeleteOption(collection)
+	switch pk.DataType {
+	case entity.FieldTypeInt64:
+		ids := make([]int64, len(pks))
+		for i, v := range pks {
+			n, ok := toInt64(v)
+			if !ok {
+				return WriteResult{}, fmt.Errorf("primary key %q: %v is not an integer", pk.Name, v)
+			}
+			ids[i] = n
+		}
+		opt = opt.WithInt64IDs(pk.Name, ids)
+	case entity.FieldTypeVarChar, entity.FieldTypeString:
+		ids := make([]string, len(pks))
+		for i, v := range pks {
+			s, ok := v.(string)
+			if !ok {
+				return WriteResult{}, fmt.Errorf("primary key %q: %v is not a string", pk.Name, v)
+			}
+			ids[i] = s
+		}
+		opt = opt.WithStringIDs(pk.Name, ids)
+	default:
+		return WriteResult{}, fmt.Errorf("collection %q: primary key of type %s cannot be deleted", collection, pk.DataType)
+	}
+
+	res, err := e.deleteOpt(ctx, collection, opt)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	return WriteResult{Count: res.DeleteCount}, nil
+}
+
+// deleteOpt runs one delete call, retrying once behind an auto-load:
+// deletes are DML like reads, and Milvus refuses them against unloaded
+// collections the same way.
+func (e *MilvusExecutor) deleteOpt(ctx context.Context, collection string, opt milvusclient.DeleteOption) (milvusclient.DeleteResult, error) {
+	res, err := e.cli.Delete(ctx, opt)
+	if err == nil {
+		return res, nil
+	}
+	if !strings.Contains(err.Error(), "not loaded") {
+		return milvusclient.DeleteResult{}, fmt.Errorf("delete from collection %q: %w", collection, err)
+	}
+	if err := e.loadAndWait(ctx, collection); err != nil {
+		return milvusclient.DeleteResult{}, fmt.Errorf("auto-load collection %q: %w", collection, err)
+	}
+	res, err = e.cli.Delete(ctx, opt)
+	if err != nil {
+		return milvusclient.DeleteResult{}, fmt.Errorf("delete from collection %q after auto-load: %w", collection, err)
+	}
+	return res, nil
+}
+
 // write is the shared body of Insert and Upsert: validate strictly, build
 // one column per non-autoID field, send.
 func (e *MilvusExecutor) write(ctx context.Context, collection string, rows []translate.WriteRow, upsert bool) (WriteResult, error) {

@@ -441,6 +441,25 @@ DDL remains a separate later slice).
   name. Execution is read-modify-write: fetch every match (whole rows,
   capped at the same 10000 window reads sort in), apply SET, upsert each
   back, `UPDATE n` completes. `INSERT 0 n` keeps PG's tag shape.
+- **DELETE (2026-10-25)**: both frontends, one shape — lower the filter,
+  fetch the matches' primary keys (the fetch narrows to the key column;
+  a delete needs addresses, not rows), and remove them by key
+  (`Executor.Delete`, Milvus's pk-membership delete; the count is the
+  server's answer). PG: `DELETE FROM t WHERE …` — WHERE is mandatory
+  (a bare DELETE would remove the collection; same refusal as UPDATE),
+  `DELETE n` completes, aliases/USING/RETURNING refuse by name, no-WHERE
+  and beyond-window matches answer 0A000. ES: `DELETE /{index}/_doc/{id}`
+  (200 result=deleted; a missing document is 404 result=not_found) and
+  `POST /{index}/_delete_by_query` (the query member rides the search
+  translator; the response reports total=deleted, batches=1, neutral
+  retries/throttling; max_docs/scroll/slices/requests_per_second refuse
+  by name — silence would promise a batching shape the synchronous delete
+  does not have). **A query that matches every row refuses on both
+  frontends** (0A000 / unsupported_exception) instead of deleting
+  unbounded, and a match count beyond store.WriteScanLimit (10000, the
+  shared write window UPDATE already bounded — now refusing instead of
+  silently rewriting a prefix) refuses before anything is deleted. NoMatch
+  plans short-circuit to `DELETE 0` / deleted:0 with zero round trips.
 - **pk/autoID policy**: this settles the 2026-09-18 proposal's key
   question for the current surface — pk is client-owned unless the
   schema says AutoID (then it is store-owned, always); ES _id and the
@@ -462,7 +481,7 @@ DDL remains a separate later slice).
   back **empty** rather than erroring — the read path's "server rejects a
   disagreeing metric" assumption no longer holds on this server; a local
   metric-vs-index check is a candidate follow-up.
-- **Not done here**: DELETE (doc or by_query), _bulk, _update_by_query,
+- **Not done here**: _bulk, _update_by_query,
   scripts, DDL (create index/mapping), array/sparse write encodings,
   upsert-by-ES-of-partial-doc (the ES index API stays whole-row put, as
   ES defines it).

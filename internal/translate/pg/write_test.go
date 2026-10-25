@@ -197,6 +197,73 @@ func TestUpdateFalseWhereLowersToNoMatch(t *testing.T) {
 	}
 }
 
+func TestParseDeleteAndLower(t *testing.T) {
+	del, err := ParseDelete("DELETE FROM items WHERE price < 3")
+	if err != nil {
+		t.Fatalf("ParseDelete: %v", err)
+	}
+	if del.Table != "items" {
+		t.Fatalf("table = %q", del.Table)
+	}
+	plan, err := del.Lower(writeSchema)
+	if err != nil {
+		t.Fatalf("Lower: %v", err)
+	}
+	if plan == nil || plan.Expr == nil {
+		t.Fatal("expected a filter plan")
+	}
+	if plan.Limit != 0 {
+		t.Fatalf("plan.Limit = %d, caller bounds it", plan.Limit)
+	}
+}
+
+func TestParseDeleteQualifiers(t *testing.T) {
+	del, err := ParseDelete("DELETE FROM items WHERE items.price < 3")
+	if err != nil {
+		t.Fatalf("ParseDelete: %v", err)
+	}
+	if _, err := del.Lower(writeSchema); err != nil {
+		t.Fatalf("Lower: %v", err)
+	}
+	if _, err := ParseDelete("DELETE FROM items WHERE other.x = 1"); err == nil {
+		t.Fatal("expected other-table qualifier rejection")
+	}
+}
+
+func TestParseDeleteNamedRejections(t *testing.T) {
+	cases := []struct{ sql, want string }{
+		{"DELETE FROM items", "WHERE"},
+		{"DELETE FROM items AS a WHERE a.id = 7", "aliases"},
+		{"DELETE FROM items a WHERE a.id = 7", "aliases"},
+		{"DELETE FROM items USING other WHERE items.id = 7", "USING"},
+		{"DELETE FROM public.items WHERE id = 7", "schema-qualified"},
+		{"DELETE FROM items WHERE id = 7 RETURNING id", "RETURNING"},
+	}
+	for _, tc := range cases {
+		_, err := ParseDelete(tc.sql)
+		if err == nil {
+			t.Fatalf("%q: expected rejection", tc.sql)
+		}
+		if !containsFold(err.Error(), tc.want) {
+			t.Fatalf("%q: error %q does not name [%s]", tc.sql, err.Error(), tc.want)
+		}
+	}
+}
+
+func TestDeleteFalseWhereLowersToNoMatch(t *testing.T) {
+	del, err := ParseDelete("DELETE FROM items WHERE id = 7 AND FALSE")
+	if err != nil {
+		t.Fatalf("ParseDelete: %v", err)
+	}
+	plan, err := del.Lower(writeSchema)
+	if err != nil {
+		t.Fatalf("Lower: %v", err)
+	}
+	if !plan.NoMatch {
+		t.Fatal("expected NoMatch for a constant-false WHERE")
+	}
+}
+
 func containsFold(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }

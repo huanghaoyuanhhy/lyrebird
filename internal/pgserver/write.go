@@ -11,15 +11,17 @@ import (
 	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
 	"go.uber.org/zap"
 
+	"github.com/huanghaoyuanhhy/lyrebird/internal/catalog"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate/pg"
 )
 
-// updateScanLimit caps how many rows one UPDATE may rewrite. The
-// read-modify-write streams every match through the same window the read
-// path sorts in, so a write cannot exceed what a SELECT could fetch.
-const updateScanLimit = 10000
+// The write statements bound their scan with store.WriteScanLimit: the
+// read-modify-write (UPDATE) and the delete lane stream every match through
+// the same window the read path sorts in, so a write cannot exceed what a
+// SELECT could fetch — a statement matching more refuses instead of
+// silently touching a prefix.
 
 // writeWireError renders a write-path failure as a PG wire error: a strict
 // schema rejection carries its SQLSTATE (the class → code table below) so
@@ -122,12 +124,16 @@ func (s *Server) writeUpdateStatement(exec store.Executor, upd *pg.Update) wire.
 		if err != nil {
 			return wireError(err)
 		}
-		plan.Limit = updateScanLimit
+		plan.Limit = store.WriteScanLimit
 
 		result, err := exec.Search(ctx, upd.Table, plan)
 		if err != nil {
 			s.zapLogger().Error("update scan failed", zap.String("table", upd.Table), zap.Error(err))
 			return wireError(err)
+		}
+		if result.Total > store.WriteScanLimit {
+			return psqlerr.WithCode(fmt.Errorf("UPDATE matched %d rows, beyond the %d-row write window: narrow the WHERE clause",
+				result.Total, store.WriteScanLimit), codes.FeatureNotSupported)
 		}
 
 		rows := make([]translate.WriteRow, 0, len(result.Hits))
@@ -154,4 +160,89 @@ func (s *Server) writeUpdateStatement(exec store.Executor, upd *pg.Update) wire.
 			zap.Duration("took", time.Since(start)))
 		return writer.Complete(fmt.Sprintf("UPDATE %d", writeResult.Count))
 	}
+}
+
+// writeDeleteStatement is the DELETE statement body: lower the WHERE, fetch
+// the matched rows' primary keys (the fetch narrows to the key — a delete
+// needs addresses, not rows), and delete by key. Matches beyond the write
+// window refuse rather than silently removing part of the set.
+func (s *Server) writeDeleteStatement(exec store.Executor, del *pg.Delete) wire.PreparedStatementFn {
+	return func(ctx context.Context, writer wire.DataWriter, parameters []wire.Parameter) (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = psqlerr.WithCode(fmt.Errorf("internal error while executing the statement: %v", p), codes.Internal)
+			}
+		}()
+		if len(parameters) > 0 {
+			return psqlerr.WithCode(errors.New("bind parameters are beyond the lyrebird write path: inline the literals"), codes.FeatureNotSupported)
+		}
+
+		start := time.Now()
+		schema, err := exec.Schema(ctx, del.Table)
+		if err != nil {
+			if errors.Is(err, store.ErrCollectionNotFound) {
+				return psqlerr.WithCode(fmt.Errorf("relation %q does not exist", del.Table), codes.UndefinedTable)
+			}
+			return wireError(err)
+		}
+		plan, err := del.Lower(schema)
+		if err != nil {
+			return wireError(err)
+		}
+		meta, err := exec.Describe(ctx, del.Table)
+		if err != nil {
+			if errors.Is(err, store.ErrCollectionNotFound) {
+				return psqlerr.WithCode(fmt.Errorf("relation %q does not exist", del.Table), codes.UndefinedTable)
+			}
+			return wireError(err)
+		}
+		pk := primaryKeyField(meta)
+		if pk.Name == "" {
+			return psqlerr.WithCode(fmt.Errorf("relation %q has no primary key field", del.Table), codes.Internal)
+		}
+
+		plan.Limit = store.WriteScanLimit
+		plan.Source = translate.SourceFilter{FetchSource: true, Includes: []string{pk.Name}}
+		result, err := exec.Search(ctx, del.Table, plan)
+		if err != nil {
+			s.zapLogger().Error("delete scan failed", zap.String("table", del.Table), zap.Error(err))
+			return wireError(err)
+		}
+		if result.Total > store.WriteScanLimit {
+			return psqlerr.WithCode(fmt.Errorf("DELETE matched %d rows, beyond the %d-row write window: narrow the WHERE clause",
+				result.Total, store.WriteScanLimit), codes.FeatureNotSupported)
+		}
+
+		pks := make([]any, 0, len(result.Hits))
+		for _, hit := range result.Hits {
+			pks = append(pks, hit.Source[pk.Name])
+		}
+		if len(pks) == 0 {
+			// nothing matched (or the WHERE folded to constant false): no
+			// delete call at all
+			return writer.Complete("DELETE 0")
+		}
+		writeResult, err := exec.Delete(ctx, del.Table, pks)
+		if err != nil {
+			s.zapLogger().Error("delete execution failed", zap.String("table", del.Table), zap.Error(err))
+			return writeWireError(err)
+		}
+
+		s.zapLogger().Info("pg delete",
+			zap.String("table", del.Table),
+			zap.Int64("scanned", result.Total),
+			zap.Int64("deleted", writeResult.Count),
+			zap.Duration("took", time.Since(start)))
+		return writer.Complete(fmt.Sprintf("DELETE %d", writeResult.Count))
+	}
+}
+
+// primaryKeyField returns the collection's primary-key field.
+func primaryKeyField(meta catalog.CollectionMeta) catalog.FieldMeta {
+	for _, f := range meta.Fields {
+		if f.PrimaryKey {
+			return f
+		}
+	}
+	return catalog.FieldMeta{}
 }

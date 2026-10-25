@@ -28,12 +28,16 @@ type fakeExecutor struct {
 	// alt holds schemas for databases other than the default; absent
 	// databases answer not-found like the real store.
 	alt    map[string]map[string]translate.Schema
+	pks    map[string]string
 	result *store.SearchResult
 	err    error
 
 	// writeCalls records every Insert/Upsert the fake was asked to run.
 	writeCalls []writeCall
 	writeErr   error
+	// deleteCalls records every Delete the fake was asked to run.
+	deleteCalls []deleteCall
+	deleteErr   error
 }
 
 // writeCall is one recorded write.
@@ -43,8 +47,31 @@ type writeCall struct {
 	Upsert     bool
 }
 
+// deleteCall is one recorded delete.
+type deleteCall struct {
+	Collection string
+	PKs        []any
+}
+
 func (f *fakeExecutor) Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error) {
-	return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, collection)
+	schema, ok := f.schemas[collection]
+	if !ok {
+		return catalog.CollectionMeta{}, fmt.Errorf("%w: %s", store.ErrCollectionNotFound, collection)
+	}
+	pk := f.pks[collection]
+	meta := catalog.CollectionMeta{Name: collection}
+	for _, field := range schema.Fields() {
+		meta.Fields = append(meta.Fields, catalog.FieldMeta{Name: field, Type: schema.FieldType(field), PrimaryKey: field == pk})
+	}
+	return meta, nil
+}
+
+func (f *fakeExecutor) Delete(ctx context.Context, collection string, pks []any) (store.WriteResult, error) {
+	if f.deleteErr != nil {
+		return store.WriteResult{}, f.deleteErr
+	}
+	f.deleteCalls = append(f.deleteCalls, deleteCall{Collection: collection, PKs: pks})
+	return store.WriteResult{Count: int64(len(pks))}, nil
 }
 
 func (f *fakeExecutor) Insert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
@@ -73,6 +100,9 @@ func (f *fakeExecutor) Schema(ctx context.Context, collection string) (translate
 func (f *fakeExecutor) Search(ctx context.Context, collection string, plan *translate.Plan) (*store.SearchResult, error) {
 	if f.err != nil {
 		return nil, f.err
+	}
+	if plan.NoMatch {
+		return &store.SearchResult{}, nil // the real store short-circuits
 	}
 	// Honor the plan's window the way the real store does: LIMIT 0 counts
 	// only, a capped fetch truncates, no cap returns everything fetched.
@@ -193,6 +223,7 @@ func testExecutor() *fakeExecutor {
 				"note":  translate.TypeKeyword, // nullable
 			},
 		},
+		pks: map[string]string{"items": "id"},
 		result: &store.SearchResult{
 			Total: 2,
 			Hits: []store.Hit{
@@ -304,7 +335,7 @@ func TestSQLErrorsNative(t *testing.T) {
 	}{
 		{"SELECT name FROM items", "0A000"},        // LIMIT required
 		{"SELECT FROM items LIMIT 1", "42601"},     // syntax
-		{"DELETE FROM items", "0A000"},             // read-only subset
+		{"DELETE FROM items", "0A000"},             // no WHERE: would remove every row
 		{"SELECT * FROM no_such LIMIT 1", "42P01"}, /* absent table */
 	}
 	for _, mode := range []string{"cache_statement", "simple_protocol"} {
