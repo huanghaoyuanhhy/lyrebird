@@ -212,7 +212,9 @@ func (s *Select) Plan(schema translate.Schema) (*translate.Plan, error) {
 	}
 
 	w := fold(s.where)
-	if isFalse(w) {
+	// The unknown constant never passes a WHERE (only TRUE rows do) and a
+	// NOT cannot resurrect it — fold would have pushed that NOT down.
+	if isFalse(w) || isUnknown(w) || neverTrue(w) {
 		plan.NoMatch = true
 		return plan, nil
 	}

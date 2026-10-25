@@ -182,6 +182,22 @@ the UAT cluster):
   catalog decision.
 - LIMIT is mandatory on every SELECT: the alternative is streaming the
   whole collection through the client-side sort path.
+- **The NULL literal folds to unknown, not false (2026-10-25).** PG is
+  three-valued regardless of column nullability: a comparison against the
+  NULL literal is unknown on every row, so it never passes a WHERE — but
+  `NOT unknown` is still unknown, whereas `NOT false` is true. The parser
+  therefore emits a dedicated unknown constant instead of folding to
+  false, and carries NULL facts structurally (`hadNull` on IN, null
+  bounds on BETWEEN) so fold can negate them exactly: a negated IN with a
+  NULL member lowers to the positive IN, a BETWEEN with one NULL bound
+  lowers to the opposite single-bound comparison. Inside and/or the
+  unknown renders as the constant false (`false and e` filters
+  everything, `false or e` is e — both exact); only a direct NOT is
+  special, and fold pushes it through De Morgan so the unknown is never
+  negated. First casualty of the old fold-to-false: `NOT (x = NULL)`
+  matched everything where PG returns zero rows. Decision table:
+  internal/translate/pg TestThreeValuedLogic; parity: internal/pgserver
+  TestPgserverParity NULL cases (reference Postgres judges).
 
 ## Settled — pg vector search: the pgvector distance path (2026-09-18)
 
