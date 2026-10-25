@@ -119,6 +119,17 @@ type Schema interface {
 	Fields() []string
 }
 
+// NullableSchema is the optional Schema extension answering whether a field
+// admits nulls. Translators type-assert it: an implementation without it
+// reports nothing, which reads as "no field is nullable" — the conservative
+// reading that keeps the plain rendering for every caller that has not opted
+// in. MilvusExecutor.Schema provides it from the collection's real schema;
+// negation over a nullable field needs the fact to stay three-valued correct
+// (docs/design.md).
+type NullableSchema interface {
+	Nullable(field string) bool
+}
+
 // MapSchema is a Schema backed by a plain map; absent fields are unknown.
 type MapSchema map[string]FieldType
 
