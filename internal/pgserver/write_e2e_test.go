@@ -156,7 +156,7 @@ func TestPgserverWriteE2E(t *testing.T) {
 			t.Fatalf("tag = %q, want DELETE 1", tag.String())
 		}
 
-		waitGone(t, ctx, conn, fmt.Sprintf("SELECT 1 FROM %s WHERE id = 21 LIMIT 1", table))
+		waitGone(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s WHERE id = 21 LIMIT 1", table))
 		waitVisible(t, ctx, conn,
 			fmt.Sprintf("SELECT name FROM %s WHERE id = 22 LIMIT 1", table), new(string))
 	})
