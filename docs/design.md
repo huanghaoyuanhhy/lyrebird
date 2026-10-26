@@ -468,14 +468,24 @@ DDL remains a separate later slice).
   (read-modify-write), so the window is a resource bound there, not a
   policy gate — and beyond-window UPDATEs refuse rather than silently
   rewriting a prefix (that fix stays).
-- **Delete counts are a count(*) snapshot, not Milvus's DeleteCount**
-  (first CI run's finding, 2026-10-26): the server's delete statistic is
-  best-effort — re-deleting an already-deleted primary key reported 1,
-  and a match-all over 6 rows reported 5 — so DeleteCount can neither
-  decide ES's not_found envelope nor fill PG's `DELETE n`. The store takes
-  a count(*) just before the delete (the ES snapshot-reporting semantics)
-  and uses it for every reported figure; DeleteCount is the fallback only
-  when the count fails.
+- **Delete counts are Milvus's own DeleteCount** (probed directly with the
+  raw SDK, `TestMilvusDeleteCountProbe`, kept as the pin): on settled data
+  the server statistic is exact — an existing key deletes 1, a re-deleted
+  key deletes 0, an N-row filter deletes N. An earlier count(*)
+  pre-query was removed: it added a second filter evaluation without
+  buying any correctness (it reads the same snapshots the delete
+  resolves against). One window does exist and is a platform fact: the
+  delete's expression resolution runs on a bounded snapshot (the SDK
+  exposes no consistency setting for Delete), so a delete issued
+  milliseconds after the write it targets can miss it — first CI run's
+  two anomalies (a re-delete reporting 1, a match-all over 6 rows
+  reporting 5) were both this window, not statistic inaccuracy. Clients
+  that need a write to be deleted must let it become visible first, the
+  same read-your-writes window every read here polls; real
+  Elasticsearch's `_delete_by_query` without `refresh` has the same
+  default shape, and on the PG side it is the standing no-transactions
+  limitation. The e2e suites therefore settle writes (waitVisible /
+  waitGone) before asserting delete counts.
 - **pk/autoID policy**: this settles the 2026-09-18 proposal's key
   question for the current surface — pk is client-owned unless the
   schema says AutoID (then it is store-owned, always); ES _id and the

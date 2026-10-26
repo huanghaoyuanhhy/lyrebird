@@ -97,20 +97,22 @@ const WriteScanLimit = 10000
 
 // Delete removes every row the filter matches, server-side: the expression
 // renders in the same dialect the read path filters with, Milvus resolves
-// the matching primary keys and writes tombstones. A nil expr matches
-// everything — rendered as `pk is not null` (the primary key is never
-// null) because Milvus's delete, unlike its query, does not read an empty
-// expression as match-all.
+// the matching primary keys and writes tombstones, and the reported count
+// is the server's DeleteCount. A nil expr matches everything — rendered as
+// `pk is not null` (the primary key is never null) because Milvus's delete,
+// unlike its query, does not read an empty expression as match-all.
 //
-// The reported count comes from a count(*) taken just before the delete,
-// not from Milvus's DeleteCount: the server statistic is best-effort
-// (observed on v3.0.2 — re-deleting an already-deleted key reports 1, and
-// a match-all over 6 rows reported 5), while clients expect DELETE n /
-// deleted:N to be exact. The count is a snapshot of the moment before the
-// delete, the same snapshot semantics ES's own _delete_by_query reports
-// with; a concurrent delete in between can skew it. Milvus's DeleteCount is
-// discarded (best-effort statistic); it serves as the fallback only when
-// the count itself fails.
+// DeleteCount measured exact on settled data (raw-SDK probe on v3.0.2, kept
+// as TestMilvusDeleteCountProbe: an existing key deletes 1, a re-deleted
+// key deletes 0, an N-row filter deletes N). One window does exist and is
+// a platform fact, not a statistic flaw: the delete's expression resolution
+// runs on a bounded snapshot — the SDK exposes no consistency setting for
+// Delete — so a delete issued milliseconds after the write it targets can
+// miss it (observed: a re-delete reporting 1 for an already-tombstoned
+// key, a match-all over 6 rows reporting 5). Clients that need a write to
+// be deleted must let it become visible first, the same read-your-writes
+// window every read here already polls for; real Elasticsearch's
+// _delete_by_query without refresh has the same shape by default.
 func (e *MilvusExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (WriteResult, error) {
 	filter := expr
 	if filter == nil {
@@ -129,21 +131,11 @@ func (e *MilvusExecutor) Delete(ctx context.Context, collection string, expr tra
 		return WriteResult{}, fmt.Errorf("render delete filter for collection %q: %w", collection, err)
 	}
 
-	// a nil expr renders as "" for the count query — Milvus reads an empty
-	// query expression as match-all.
-	countExpr, err := translate.Render(expr)
-	if err != nil {
-		return WriteResult{}, fmt.Errorf("render delete count for collection %q: %w", collection, err)
-	}
-	n, countErr := e.count(ctx, collection, countExpr)
 	res, err := e.deleteOpt(ctx, collection, milvusclient.NewDeleteOption(collection).WithExpr(rendered))
 	if err != nil {
 		return WriteResult{}, err
 	}
-	if countErr != nil {
-		return WriteResult{Count: res.DeleteCount}, nil
-	}
-	return WriteResult{Count: n}, nil
+	return WriteResult{Count: res.DeleteCount}, nil
 }
 
 // deleteOpt runs one delete call, retrying once behind an auto-load:

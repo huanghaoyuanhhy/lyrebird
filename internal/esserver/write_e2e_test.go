@@ -218,12 +218,18 @@ func TestEsserverWriteE2E(t *testing.T) {
 				t.Fatalf("seed %s: status=%d body=%v", id, status, body)
 			}
 		}
+		// let the writes become visible before deleting: the delete's
+		// expression resolution runs on a bounded snapshot, so a delete
+		// issued immediately after the write can miss it (the same
+		// read-your-writes window every searchOne/waitGone here polls for)
+		searchOne(t, "201")
 
 		// delete one document: 200 deleted; a second delete: 404 not_found
 		status, body := do(t, "DELETE", "/"+index+"/_doc/201", "")
 		if status != http.StatusOK || body["result"] != "deleted" {
 			t.Fatalf("delete status=%d body=%v", status, body)
 		}
+		waitGone(index, "201") // let the tombstone settle before re-deleting
 		status, body = do(t, "DELETE", "/"+index+"/_doc/201", "")
 		if status != http.StatusNotFound || body["result"] != "not_found" {
 			t.Fatalf("re-delete status=%d body=%v", status, body)

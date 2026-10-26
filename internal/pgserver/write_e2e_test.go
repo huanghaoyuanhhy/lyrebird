@@ -146,6 +146,12 @@ func TestPgserverWriteE2E(t *testing.T) {
 		if tag.String() != "INSERT 0 2" {
 			t.Fatalf("insert tag = %q", tag.String())
 		}
+		// let the inserts become visible before deleting: the delete's
+		// expression resolution runs on a bounded snapshot, so a delete
+		// issued immediately after the write can miss it (the same
+		// read-your-writes window every read-back here polls for)
+		waitVisible(t, ctx, conn,
+			fmt.Sprintf("SELECT name FROM %s WHERE id = 21 LIMIT 1", table), new(string))
 
 		tag, err = conn.Exec(ctx,
 			fmt.Sprintf("DELETE FROM %s WHERE name = 'victim'", table))
@@ -174,9 +180,11 @@ func TestPgserverWriteE2E(t *testing.T) {
 		if tag.String() != "INSERT 0 2" {
 			t.Fatalf("insert tag = %q", tag.String())
 		}
+		waitVisible(t, ctx, conn,
+			fmt.Sprintf("SELECT name FROM %s WHERE id = 32 LIMIT 1", table), new(string))
 
 		// the bare statement is legal PostgreSQL and deletes every row; the
-		// tag is exact (a count(*) snapshot taken before the delete)
+		// tag is the server's count over the now-settled rows
 		tag, err = conn.Exec(ctx, fmt.Sprintf("DELETE FROM %s", table))
 		if err != nil {
 			t.Fatalf("delete: %v", err)
