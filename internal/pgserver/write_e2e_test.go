@@ -161,6 +161,28 @@ func TestPgserverWriteE2E(t *testing.T) {
 			fmt.Sprintf("SELECT name FROM %s WHERE id = 22 LIMIT 1", table), new(string))
 	})
 
+	t.Run("delete without where removes everything", func(t *testing.T) {
+		tag, err := conn.Exec(ctx,
+			fmt.Sprintf("INSERT INTO %s (id, name, price, active, emb) VALUES (31, 'all-a', 1, true, '[1, 1]'), (32, 'all-b', 2, false, '[0, 1]')", table))
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if tag.String() != "INSERT 0 2" {
+			t.Fatalf("insert tag = %q", tag.String())
+		}
+
+		// the bare statement is legal PostgreSQL and deletes every row
+		tag, err = conn.Exec(ctx, fmt.Sprintf("DELETE FROM %s", table))
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if tag.String() != "DELETE 2" {
+			t.Fatalf("tag = %q, want DELETE 2 (server DeleteCount)", tag.String())
+		}
+		waitGone(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s WHERE id = 31 LIMIT 1", table))
+		waitGone(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s WHERE id = 32 LIMIT 1", table))
+	})
+
 	t.Run("insert vector literal and query by distance", func(t *testing.T) {
 		tag, err := conn.Exec(ctx,
 			fmt.Sprintf("INSERT INTO %s (id, name, price, active, emb) VALUES (13, 'thirteen', 3, true, '[1, 0]')", table))

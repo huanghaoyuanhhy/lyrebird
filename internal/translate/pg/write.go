@@ -309,16 +309,18 @@ func (u *Update) Lower(schema translate.Schema) (set translate.WriteRow, plan *t
 }
 
 // Delete is one parsed DELETE statement: the filter naming the rows to
-// remove.
+// remove. No WHERE clause is legal — it removes every row, the way
+// PostgreSQL defines it.
 type Delete struct {
 	Table string
 
-	where whereExpr // nil = no WHERE clause (rejected at parse time)
+	// where is nil when the statement carries no WHERE clause (delete all).
+	where whereExpr
 }
 
-// ParseDelete compiles one DELETE statement. A bare DELETE without WHERE
-// would remove the whole collection and is refused the way a read without
-// LIMIT and an UPDATE without WHERE are: name the rows.
+// ParseDelete compiles one DELETE statement. Both shapes are legal:
+// `DELETE FROM t WHERE …` names the rows, bare `DELETE FROM t` removes
+// everything.
 func ParseDelete(sql string) (*Delete, error) {
 	toks, err := lex(sql)
 	if err != nil {
@@ -357,8 +359,6 @@ func ParseDelete(sql string) (*Delete, error) {
 			return nil, err
 		}
 		d.where = w
-	} else {
-		return nil, unsupportedErrf("DELETE without WHERE would remove every row: add a WHERE clause naming the rows")
 	}
 	if err := writeStatementEnd(p, "DELETE"); err != nil {
 		return nil, err
@@ -366,31 +366,35 @@ func ParseDelete(sql string) (*Delete, error) {
 
 	// qualifiers: columns may be written as items.status; anything else
 	// names a second table
-	strip := func(col string) (string, error) {
-		qual, name, dotted := strings.Cut(col, ".")
-		if !dotted {
-			return col, nil
+	if d.where != nil {
+		strip := func(col string) (string, error) {
+			qual, name, dotted := strings.Cut(col, ".")
+			if !dotted {
+				return col, nil
+			}
+			if qual == d.Table {
+				return name, nil
+			}
+			return "", unsupportedErrf("column reference [%s] names another table: writes are single-table", col)
 		}
-		if qual == d.Table {
-			return name, nil
+		where, err := stripWhereQualifiers(d.where, strip)
+		if err != nil {
+			return nil, err
 		}
-		return "", unsupportedErrf("column reference [%s] names another table: writes are single-table", col)
+		d.where = where
 	}
-	where, err := stripWhereQualifiers(d.where, strip)
-	if err != nil {
-		return nil, err
-	}
-	d.where = where
 	return d, nil
 }
 
-// Lower folds the WHERE into the filter plan the caller executes to find
-// the rows to remove. The plan fetches only what the caller narrows it to
-// (a delete needs the primary keys, not the rows) and sets no limit — the
-// caller bounds the match count.
+// Lower folds the WHERE into the filter the store deletes by. A nil filter
+// matches everything; a constant-false WHERE lowers to a NoMatch plan
+// (nothing to delete, zero round trips).
 func (d *Delete) Lower(schema translate.Schema) (*translate.Plan, error) {
 	if schema == nil {
 		schema = translate.MapSchema{}
+	}
+	if d.where == nil {
+		return &translate.Plan{}, nil
 	}
 	return lowerWhere(d.where, schema)
 }

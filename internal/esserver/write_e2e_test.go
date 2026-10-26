@@ -240,5 +240,19 @@ func TestEsserverWriteE2E(t *testing.T) {
 		waitGone(index, "201")
 		waitGone(index, "202")
 		searchOne(t, "203")
+
+		// match_all deletes everything, as it does in Elasticsearch: the
+		// index still holds docs 101, 102 and 203 at this point
+		status, body = do(t, "POST", "/"+index+"/_delete_by_query", `{"query":{"match_all":{}}}`)
+		if status != http.StatusOK {
+			t.Fatalf("match_all status=%d body=%v", status, body)
+		}
+		total, _ := body["total"].(float64)
+		deleted, _ := body["deleted"].(float64)
+		if total != deleted || total < 3 {
+			t.Fatalf("match_all total=%v deleted=%v, want equal and >= 3", body["total"], body["deleted"])
+		}
+		waitGone(index, "101")
+		waitGone(index, "203")
 	})
 }

@@ -38,6 +38,8 @@ type fakeExecutor struct {
 	// deleteCalls records every Delete the fake was asked to run.
 	deleteCalls []deleteCall
 	deleteErr   error
+	// deleteCount plays the server-reported DeleteCount.
+	deleteCount int64
 }
 
 // writeCall is one recorded write.
@@ -47,10 +49,11 @@ type writeCall struct {
 	Upsert     bool
 }
 
-// deleteCall is one recorded delete.
+// deleteCall is one recorded delete: the collection and the rendered
+// filter (nil expr = match everything).
 type deleteCall struct {
 	Collection string
-	PKs        []any
+	Expr       translate.Expr
 }
 
 func (f *fakeExecutor) Describe(ctx context.Context, collection string) (catalog.CollectionMeta, error) {
@@ -66,12 +69,12 @@ func (f *fakeExecutor) Describe(ctx context.Context, collection string) (catalog
 	return meta, nil
 }
 
-func (f *fakeExecutor) Delete(ctx context.Context, collection string, pks []any) (store.WriteResult, error) {
+func (f *fakeExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (store.WriteResult, error) {
 	if f.deleteErr != nil {
 		return store.WriteResult{}, f.deleteErr
 	}
-	f.deleteCalls = append(f.deleteCalls, deleteCall{Collection: collection, PKs: pks})
-	return store.WriteResult{Count: int64(len(pks))}, nil
+	f.deleteCalls = append(f.deleteCalls, deleteCall{Collection: collection, Expr: expr})
+	return store.WriteResult{Count: f.deleteCount}, nil
 }
 
 func (f *fakeExecutor) Insert(ctx context.Context, collection string, rows []translate.WriteRow) (store.WriteResult, error) {
@@ -335,7 +338,6 @@ func TestSQLErrorsNative(t *testing.T) {
 	}{
 		{"SELECT name FROM items", "0A000"},        // LIMIT required
 		{"SELECT FROM items LIMIT 1", "42601"},     // syntax
-		{"DELETE FROM items", "0A000"},             // no WHERE: would remove every row
 		{"SELECT * FROM no_such LIMIT 1", "42P01"}, /* absent table */
 	}
 	for _, mode := range []string{"cache_statement", "simple_protocol"} {

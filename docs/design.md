@@ -441,25 +441,33 @@ DDL remains a separate later slice).
   name. Execution is read-modify-write: fetch every match (whole rows,
   capped at the same 10000 window reads sort in), apply SET, upsert each
   back, `UPDATE n` completes. `INSERT 0 n` keeps PG's tag shape.
-- **DELETE (2026-10-25)**: both frontends, one shape — lower the filter,
-  fetch the matches' primary keys (the fetch narrows to the key column;
-  a delete needs addresses, not rows), and remove them by key
-  (`Executor.Delete`, Milvus's pk-membership delete; the count is the
-  server's answer). PG: `DELETE FROM t WHERE …` — WHERE is mandatory
-  (a bare DELETE would remove the collection; same refusal as UPDATE),
-  `DELETE n` completes, aliases/USING/RETURNING refuse by name, no-WHERE
-  and beyond-window matches answer 0A000. ES: `DELETE /{index}/_doc/{id}`
-  (200 result=deleted; a missing document is 404 result=not_found) and
-  `POST /{index}/_delete_by_query` (the query member rides the search
-  translator; the response reports total=deleted, batches=1, neutral
-  retries/throttling; max_docs/scroll/slices/requests_per_second refuse
-  by name — silence would promise a batching shape the synchronous delete
-  does not have). **A query that matches every row refuses on both
-  frontends** (0A000 / unsupported_exception) instead of deleting
-  unbounded, and a match count beyond store.WriteScanLimit (10000, the
-  shared write window UPDATE already bounded — now refusing instead of
-  silently rewriting a prefix) refuses before anything is deleted. NoMatch
-  plans short-circuit to `DELETE 0` / deleted:0 with zero round trips.
+- **DELETE (2026-10-25, reshaped same day by the "respect the semantics,
+  minimal gateway processing" call)**: both frontends lower their native
+  filter into the shared Expr dialect and hand it to `Executor.Delete` —
+  Milvus resolves the matching primary keys and writes tombstones
+  server-side; `DeleteCount` is the count. The gateway streams no rows and
+  judges nothing: **the pre-delete refusal gates (no-WHERE, over-10000)
+  were removed** — real PostgreSQL deletes without a WHERE clause and real
+  Elasticsearch deletes with match_all, and the gateway honors both (a nil
+  filter renders as `pk is not null`, the type-agnostic match-all form,
+  because Milvus's delete does not read an empty expression as match-all
+  the way its query does). ES `DELETE /_doc/{id}` likewise lost its
+  existence pre-check: one delete call, and the server's count decides the
+  envelope — nothing removed is the 404 not_found answer, which is also
+  the honest one under concurrency. ES `total` and `deleted` carry the
+  same server count twice (one evaluation; they only diverge in real ES
+  when version conflicts skip documents). PG: `DELETE FROM t WHERE …`,
+  `DELETE n` completes, aliases/USING/RETURNING refuse by name (unimplemented
+  syntax, not policy); NoMatch plans short-circuit to `DELETE 0`. ES
+  `_delete_by_query` refuses only `max_docs` (capping the deletion and
+  staying silent would report deleted:N for fewer removed); timing knobs
+  (refresh/conflicts/wait_for_completion/slices/requests_per_second) are
+  accepted and ignored — they shape delivery, not results. knn as the
+  delete query refuses (the delete expression is scalar). The 10000 window
+  is now UPDATE's alone: UPDATE streams whole rows through the gateway
+  (read-modify-write), so the window is a resource bound there, not a
+  policy gate — and beyond-window UPDATEs refuse rather than silently
+  rewriting a prefix (that fix stays).
 - **pk/autoID policy**: this settles the 2026-09-18 proposal's key
   question for the current surface — pk is client-owned unless the
   schema says AutoID (then it is store-owned, always); ES _id and the

@@ -89,55 +89,37 @@ func (e *MilvusExecutor) Upsert(ctx context.Context, collection string, rows []t
 	return e.write(ctx, collection, rows, true)
 }
 
-// WriteScanLimit bounds how many rows one write statement may touch. The
-// read-modify-write (PG UPDATE) and the delete lanes stream their matches
-// through the same window the read path sorts in, so no write can exceed
-// what a SELECT could fetch; a statement matching more refuses instead of
-// silently touching a prefix.
+// WriteScanLimit bounds how many rows one UPDATE's read-modify-write may
+// stream through the gateway: it scans whole rows and upserts each, so the
+// window is a gateway resource bound, not a policy gate. DELETE does not
+// stream rows (the filter deletes server-side), so it has no window.
 const WriteScanLimit = 10000
 
-// Delete removes the rows with the given primary keys. Milvus deletes by a
-// pk-membership expression; the count is the server's answer.
-func (e *MilvusExecutor) Delete(ctx context.Context, collection string, pks []any) (WriteResult, error) {
-	if len(pks) == 0 {
-		return WriteResult{}, nil
+// Delete removes every row the filter matches, server-side: the expression
+// renders in the same dialect the read path filters with, Milvus resolves
+// the matching primary keys and writes tombstones, and DeleteCount is the
+// server's answer. A nil expr matches everything — rendered as `pk is not
+// null` (the primary key is never null) because Milvus's delete, unlike its
+// query, does not read an empty expression as match-all.
+func (e *MilvusExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (WriteResult, error) {
+	filter := expr
+	if filter == nil {
+		coll, err := e.describe(ctx, collection)
+		if err != nil {
+			return WriteResult{}, err
+		}
+		pk := primaryKey(coll.Schema.Fields)
+		if pk == nil {
+			return WriteResult{}, fmt.Errorf("collection %q has no primary key field", collection)
+		}
+		filter = translate.NotNull{Field: pk.Name}
 	}
-	coll, err := e.describe(ctx, collection)
+	rendered, err := translate.Render(filter)
 	if err != nil {
-		return WriteResult{}, err
-	}
-	pk := primaryKey(coll.Schema.Fields)
-	if pk == nil {
-		return WriteResult{}, fmt.Errorf("collection %q has no primary key field", collection)
+		return WriteResult{}, fmt.Errorf("render delete filter for collection %q: %w", collection, err)
 	}
 
-	opt := milvusclient.NewDeleteOption(collection)
-	switch pk.DataType {
-	case entity.FieldTypeInt64:
-		ids := make([]int64, len(pks))
-		for i, v := range pks {
-			n, ok := toInt64(v)
-			if !ok {
-				return WriteResult{}, fmt.Errorf("primary key %q: %v is not an integer", pk.Name, v)
-			}
-			ids[i] = n
-		}
-		opt = opt.WithInt64IDs(pk.Name, ids)
-	case entity.FieldTypeVarChar, entity.FieldTypeString:
-		ids := make([]string, len(pks))
-		for i, v := range pks {
-			s, ok := v.(string)
-			if !ok {
-				return WriteResult{}, fmt.Errorf("primary key %q: %v is not a string", pk.Name, v)
-			}
-			ids[i] = s
-		}
-		opt = opt.WithStringIDs(pk.Name, ids)
-	default:
-		return WriteResult{}, fmt.Errorf("collection %q: primary key of type %s cannot be deleted", collection, pk.DataType)
-	}
-
-	res, err := e.deleteOpt(ctx, collection, opt)
+	res, err := e.deleteOpt(ctx, collection, milvusclient.NewDeleteOption(collection).WithExpr(rendered))
 	if err != nil {
 		return WriteResult{}, err
 	}

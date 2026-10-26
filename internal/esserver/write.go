@@ -234,8 +234,9 @@ func (s *Server) updateDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteDocument handles DELETE /{index}/_doc/{id}: remove the row the
-// primary key addresses. A missing document is a 404 with result
-// not_found (the ES default — deletes are not upserts).
+// primary key addresses. One round trip — the delete runs, and the server's
+// count decides the envelope: nothing removed means the document was not
+// there, the ES not_found answer (also the honest one under concurrency).
 func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 	logger := s.zapLogger()
 	index := r.PathValue("index")
@@ -253,25 +254,25 @@ func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 		s.writeRequestError(logger, w, err, index)
 		return
 	}
-	if _, exists, err := s.fetchDocument(r, index, pk, pkValue(pk, parsed)); err != nil {
-		s.writeExecError(logger, w, index, err)
-		return
-	} else if !exists {
-		writeDeleteResponse(w, index, id, "not_found")
-		return
-	}
-	result, err := s.cluster.Delete(r.Context(), index, []any{parsed})
+	deleted, err := s.cluster.Delete(r.Context(), index, translate.InList{
+		Field:  pk.Name,
+		Values: []translate.Value{pkValue(pk, parsed)},
+	})
 	if err != nil {
 		logger.Error("delete execution failed", zap.String("index", index), zap.Error(err))
 		s.writeWriteError(logger, w, err, index)
 		return
 	}
+	result := "deleted"
+	if deleted.Count == 0 {
+		result = "not_found"
+	}
 	logger.Info("es delete",
 		zap.String("index", index),
 		zap.String("id", id),
-		zap.Int64("deleted", result.Count),
+		zap.Int64("deleted", deleted.Count),
 		zap.Duration("took", time.Since(start)))
-	writeDeleteResponse(w, index, id, "deleted")
+	writeDeleteResponse(w, index, id, result)
 }
 
 // writeDeleteResponse emits the DELETE /_doc/{id} envelope: 200 with
@@ -294,9 +295,10 @@ func writeDeleteResponse(w http.ResponseWriter, index, id, result string) {
 }
 
 // deleteByQuery handles POST /{index}/_delete_by_query: translate the query
-// DSL, fetch the matched rows' primary keys (the fetch narrows to the key,
-// bounded by the write window), and delete by key. A query that matches
-// every row refuses — the same boundary a PG DELETE without WHERE hits.
+// DSL into the shared filter dialect and hand it to the store — Milvus
+// resolves the matching primary keys and deletes server-side, exactly what
+// the ES statement means. Every document matching (match_all) is legal, as
+// in Elasticsearch; knn stays refused (the delete expression is scalar).
 func (s *Server) deleteByQuery(w http.ResponseWriter, r *http.Request) {
 	logger := s.zapLogger()
 	index := r.PathValue("index")
@@ -345,42 +347,13 @@ func (s *Server) deleteByQuery(w http.ResponseWriter, r *http.Request) {
 		writeUnsupported(w, "a vector search as the _delete_by_query query")
 		return
 	}
-	if plan.Expr == nil && !plan.NoMatch {
-		writeUnsupported(w, "a query that matches every document (send a query naming the documents to delete)")
+	if plan.NoMatch {
+		// match_none (or a folded constant-false shape): nothing to delete,
+		// zero round trips
+		writeDeleteByQueryResponse(w, start, 0, 0)
 		return
 	}
-
-	meta, err := s.cluster.Collection(r.Context(), "", index)
-	if err != nil {
-		s.writeExecError(logger, w, index, err)
-		return
-	}
-	pk := primaryKeyOf(meta)
-	if pk.Name == "" {
-		writeErrorEnvelope(w, http.StatusInternalServerError, "internal_error_exception",
-			"index "+index+" has no primary key field", index)
-		return
-	}
-	plan.Limit = store.WriteScanLimit
-	plan.Offset = 0
-	plan.Source = translate.SourceFilter{FetchSource: true, Includes: []string{pk.Name}}
-	matched, err := s.cluster.Search(r.Context(), index, plan)
-	if err != nil {
-		s.writeExecError(logger, w, index, err)
-		return
-	}
-	if matched.Total > store.WriteScanLimit {
-		writeErrorEnvelope(w, http.StatusBadRequest, "unsupported_exception",
-			fmt.Sprintf("the query matched %d documents, beyond the %d-document write window: narrow it",
-				matched.Total, store.WriteScanLimit), index)
-		return
-	}
-
-	pks := make([]any, 0, len(matched.Hits))
-	for _, hit := range matched.Hits {
-		pks = append(pks, hit.Source[pk.Name])
-	}
-	result, err := s.cluster.Delete(r.Context(), index, pks)
+	deleted, err := s.cluster.Delete(r.Context(), index, plan.Expr)
 	if err != nil {
 		logger.Error("delete_by_query execution failed", zap.String("index", index), zap.Error(err))
 		s.writeWriteError(logger, w, err, index)
@@ -388,14 +361,21 @@ func (s *Server) deleteByQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.Info("es delete_by_query",
 		zap.String("index", index),
-		zap.Int64("matched", matched.Total),
-		zap.Int64("deleted", result.Count),
+		zap.Int64("deleted", deleted.Count),
 		zap.Duration("took", time.Since(start)))
+	writeDeleteByQueryResponse(w, start, deleted.Count, deleted.Count)
+}
+
+// writeDeleteByQueryResponse emits the _delete_by_query envelope. total and
+// deleted carry the server's count twice: the delete is one server-side
+// evaluation, so "matched" and "removed" are the same number here — the
+// two figures only diverge in ES when version conflicts skip documents.
+func writeDeleteByQueryResponse(w http.ResponseWriter, start time.Time, total, deleted int64) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"took":                   time.Since(start).Milliseconds(),
 		"timed_out":              false,
-		"total":                  matched.Total,
-		"deleted":                result.Count,
+		"total":                  total,
+		"deleted":                deleted,
 		"batches":                1,
 		"version_conflicts":      0,
 		"noops":                  0,
@@ -407,16 +387,14 @@ func (s *Server) deleteByQuery(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// rejectDeleteParams refuses the _delete_by_query parameters whose silence
-// would lie: batching and throttling promise a progress shape the
-// synchronous delete does not have. refresh/conflicts/wait_for_completion
-// are accepted and ignored — they shape timing, not semantics here.
+// rejectDeleteParams refuses the one _delete_by_query parameter that would
+// change the result if ignored (max_docs caps the deletion — silence would
+// report deleted:N when fewer documents were actually removed). The timing
+// knobs are accepted and ignored: they shape delivery, not which documents
+// are deleted.
 func rejectDeleteParams(r *http.Request) error {
-	q := r.URL.Query()
-	for _, p := range []string{"max_docs", "scroll", "slices", "requests_per_second"} {
-		if q.Has(p) {
-			return fmt.Errorf("the %s parameter (batched or bounded deletion)", p)
-		}
+	if r.URL.Query().Has("max_docs") {
+		return fmt.Errorf("the max_docs parameter (bounded deletion)")
 	}
 	return nil
 }

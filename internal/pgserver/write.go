@@ -11,7 +11,6 @@ import (
 	psqlerr "github.com/jeroenrinzema/psql-wire/errors"
 	"go.uber.org/zap"
 
-	"github.com/huanghaoyuanhhy/lyrebird/internal/catalog"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate/pg"
@@ -162,10 +161,11 @@ func (s *Server) writeUpdateStatement(exec store.Executor, upd *pg.Update) wire.
 	}
 }
 
-// writeDeleteStatement is the DELETE statement body: lower the WHERE, fetch
-// the matched rows' primary keys (the fetch narrows to the key — a delete
-// needs addresses, not rows), and delete by key. Matches beyond the write
-// window refuse rather than silently removing part of the set.
+// writeDeleteStatement is the DELETE statement body: lower the WHERE into
+// the shared filter dialect and hand it to the store — Milvus resolves the
+// matching primary keys server-side. No WHERE clause deletes everything,
+// exactly what the statement means in PostgreSQL; a constant-false WHERE
+// completes as DELETE 0 without a round trip.
 func (s *Server) writeDeleteStatement(exec store.Executor, del *pg.Delete) wire.PreparedStatementFn {
 	return func(ctx context.Context, writer wire.DataWriter, parameters []wire.Parameter) (err error) {
 		defer func() {
@@ -189,40 +189,10 @@ func (s *Server) writeDeleteStatement(exec store.Executor, del *pg.Delete) wire.
 		if err != nil {
 			return wireError(err)
 		}
-		meta, err := exec.Describe(ctx, del.Table)
-		if err != nil {
-			if errors.Is(err, store.ErrCollectionNotFound) {
-				return psqlerr.WithCode(fmt.Errorf("relation %q does not exist", del.Table), codes.UndefinedTable)
-			}
-			return wireError(err)
-		}
-		pk := primaryKeyField(meta)
-		if pk.Name == "" {
-			return psqlerr.WithCode(fmt.Errorf("relation %q has no primary key field", del.Table), codes.Internal)
-		}
-
-		plan.Limit = store.WriteScanLimit
-		plan.Source = translate.SourceFilter{FetchSource: true, Includes: []string{pk.Name}}
-		result, err := exec.Search(ctx, del.Table, plan)
-		if err != nil {
-			s.zapLogger().Error("delete scan failed", zap.String("table", del.Table), zap.Error(err))
-			return wireError(err)
-		}
-		if result.Total > store.WriteScanLimit {
-			return psqlerr.WithCode(fmt.Errorf("DELETE matched %d rows, beyond the %d-row write window: narrow the WHERE clause",
-				result.Total, store.WriteScanLimit), codes.FeatureNotSupported)
-		}
-
-		pks := make([]any, 0, len(result.Hits))
-		for _, hit := range result.Hits {
-			pks = append(pks, hit.Source[pk.Name])
-		}
-		if len(pks) == 0 {
-			// nothing matched (or the WHERE folded to constant false): no
-			// delete call at all
+		if plan.NoMatch {
 			return writer.Complete("DELETE 0")
 		}
-		writeResult, err := exec.Delete(ctx, del.Table, pks)
+		writeResult, err := exec.Delete(ctx, del.Table, plan.Expr)
 		if err != nil {
 			s.zapLogger().Error("delete execution failed", zap.String("table", del.Table), zap.Error(err))
 			return writeWireError(err)
@@ -230,19 +200,8 @@ func (s *Server) writeDeleteStatement(exec store.Executor, del *pg.Delete) wire.
 
 		s.zapLogger().Info("pg delete",
 			zap.String("table", del.Table),
-			zap.Int64("scanned", result.Total),
 			zap.Int64("deleted", writeResult.Count),
 			zap.Duration("took", time.Since(start)))
 		return writer.Complete(fmt.Sprintf("DELETE %d", writeResult.Count))
 	}
-}
-
-// primaryKeyField returns the collection's primary-key field.
-func primaryKeyField(meta catalog.CollectionMeta) catalog.FieldMeta {
-	for _, f := range meta.Fields {
-		if f.PrimaryKey {
-			return f
-		}
-	}
-	return catalog.FieldMeta{}
 }

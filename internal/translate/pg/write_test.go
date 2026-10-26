@@ -232,7 +232,6 @@ func TestParseDeleteQualifiers(t *testing.T) {
 
 func TestParseDeleteNamedRejections(t *testing.T) {
 	cases := []struct{ sql, want string }{
-		{"DELETE FROM items", "WHERE"},
 		{"DELETE FROM items AS a WHERE a.id = 7", "aliases"},
 		{"DELETE FROM items a WHERE a.id = 7", "aliases"},
 		{"DELETE FROM items USING other WHERE items.id = 7", "USING"},
@@ -247,6 +246,21 @@ func TestParseDeleteNamedRejections(t *testing.T) {
 		if !containsFold(err.Error(), tc.want) {
 			t.Fatalf("%q: error %q does not name [%s]", tc.sql, err.Error(), tc.want)
 		}
+	}
+}
+
+func TestParseDeleteWithoutWhereMatchesEverything(t *testing.T) {
+	// bare DELETE FROM t is legal PostgreSQL: remove every row
+	del, err := ParseDelete("DELETE FROM items")
+	if err != nil {
+		t.Fatalf("ParseDelete: %v", err)
+	}
+	plan, err := del.Lower(writeSchema)
+	if err != nil {
+		t.Fatalf("Lower: %v", err)
+	}
+	if plan.NoMatch || plan.Expr != nil {
+		t.Fatalf("plan = %#v, want a match-everything plan", plan)
 	}
 }
 

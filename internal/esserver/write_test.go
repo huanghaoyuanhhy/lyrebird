@@ -304,8 +304,8 @@ func TestBulkRefused(t *testing.T) {
 
 func TestDeleteDocumentById(t *testing.T) {
 	exec := &fakeExecutor{
-		metas:  []catalog.CollectionMeta{writeMeta},
-		result: &store.SearchResult{Total: 1, Hits: []store.Hit{{ID: "7", Source: map[string]any{"id": int64(7)}}}},
+		metas:       []catalog.CollectionMeta{writeMeta},
+		deleteCount: 1,
 	}
 	srv := writeServer(t, exec)
 
@@ -316,18 +316,19 @@ func TestDeleteDocumentById(t *testing.T) {
 	if len(exec.deleteCalls) != 1 || exec.deleteCalls[0].Collection != "items" {
 		t.Fatalf("delete calls = %#v", exec.deleteCalls)
 	}
-	if pks := exec.deleteCalls[0].PKs; len(pks) != 1 || pks[0] != int64(7) {
-		t.Fatalf("pks = %#v, want the storage-encoded key", pks)
+	rendered, err := translate.Render(exec.deleteCalls[0].Expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered != `id in [7]` {
+		t.Fatalf("filter = %q, want the pk-membership form", rendered)
 	}
 
-	// a missing document answers 404 not_found, and deletes nothing
-	exec.result = &store.SearchResult{}
+	// the server's count decides the envelope: nothing removed = not_found 404
+	exec.deleteCount = 0
 	status, body = doJSON(t, srv, "DELETE", "/items/_doc/999", "")
 	if status != http.StatusNotFound || body["result"] != "not_found" {
 		t.Fatalf("missing status=%d body=%v", status, body)
-	}
-	if len(exec.deleteCalls) != 1 {
-		t.Fatalf("missing doc ran a delete: %#v", exec.deleteCalls)
 	}
 
 	// a non-numeric id for a numeric key is a 400
@@ -345,12 +346,9 @@ func TestDeleteDocumentById(t *testing.T) {
 
 func TestDeleteByQueryDeletesMatchedKeys(t *testing.T) {
 	exec := &fakeExecutor{
-		metas:  []catalog.CollectionMeta{writeMeta},
-		schema: translate.MapSchema{"id": translate.TypeNumber, "name": translate.TypeKeyword, "price": translate.TypeNumber},
-		result: &store.SearchResult{Total: 2, Hits: []store.Hit{
-			{ID: "1", Source: map[string]any{"id": int64(1)}},
-			{ID: "2", Source: map[string]any{"id": int64(2)}},
-		}},
+		metas:       []catalog.CollectionMeta{writeMeta},
+		schema:      translate.MapSchema{"id": translate.TypeNumber, "name": translate.TypeKeyword, "price": translate.TypeNumber},
+		deleteCount: 2,
 	}
 	srv := writeServer(t, exec)
 
@@ -361,24 +359,22 @@ func TestDeleteByQueryDeletesMatchedKeys(t *testing.T) {
 	if len(exec.deleteCalls) != 1 {
 		t.Fatalf("delete calls = %d", len(exec.deleteCalls))
 	}
-	if pks := exec.deleteCalls[0].PKs; len(pks) != 2 || pks[0] != int64(1) || pks[1] != int64(2) {
-		t.Fatalf("pks = %#v", pks)
+	if exec.deleteCalls[0].Expr == nil {
+		t.Fatal("filtered delete sent a nil expr")
 	}
-	// the scan narrows to the primary key, bounded by the write window
-	if inc := exec.gotPlan.Source.Includes; len(inc) != 1 || inc[0] != "id" {
-		t.Fatalf("fetch = %v, want only the primary key", inc)
-	}
-	if exec.gotPlan.Limit != store.WriteScanLimit {
-		t.Fatalf("limit = %d, want the write window", exec.gotPlan.Limit)
+	// one server-side evaluation: total and deleted carry the same count
+	if body["total"] != body["deleted"] {
+		t.Fatalf("total=%v deleted=%v, want equal", body["total"], body["deleted"])
 	}
 
-	// a query matching every document refuses, like a PG DELETE without WHERE
+	// match_all deletes everything, as it does in Elasticsearch
+	exec.deleteCount = 5
 	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"match_all":{}}}`)
-	if status != http.StatusBadRequest || body["error"].(map[string]any)["type"] != "unsupported_exception" {
+	if status != http.StatusOK || body["deleted"] != float64(5) {
 		t.Fatalf("match_all status=%d body=%v", status, body)
 	}
-	if len(exec.deleteCalls) != 1 {
-		t.Fatalf("match_all ran a delete: %#v", exec.deleteCalls)
+	if len(exec.deleteCalls) != 2 || exec.deleteCalls[1].Expr != nil {
+		t.Fatalf("match_all calls = %#v, want a nil (match-everything) expr", exec.deleteCalls)
 	}
 
 	// a body without a query member is a parse error
@@ -387,13 +383,14 @@ func TestDeleteByQueryDeletesMatchedKeys(t *testing.T) {
 		t.Fatalf("no query status=%d", status)
 	}
 
-	// matches beyond the write window refuse before anything is deleted
-	exec.result = &store.SearchResult{Total: store.WriteScanLimit + 1}
-	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"range":{"price":{"lt":3}}}}`)
+	// max_docs would cap the deletion: refusing beats silently deleting fewer
+	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query?max_docs=5", `{"query":{"match_all":{}}}`)
 	if status != http.StatusBadRequest || body["error"].(map[string]any)["type"] != "unsupported_exception" {
-		t.Fatalf("over-window status=%d body=%v", status, body)
+		t.Fatalf("max_docs status=%d body=%v", status, body)
 	}
-	if len(exec.deleteCalls) != 1 {
-		t.Fatal("over-window ran a delete")
+	// timing knobs are accepted and ignored
+	status, _ = doJSON(t, srv, "POST", "/items/_delete_by_query?slices=auto&requests_per_second=100", `{"query":{"match_all":{}}}`)
+	if status != http.StatusOK {
+		t.Fatalf("timing knobs status=%d", status)
 	}
 }

@@ -39,6 +39,8 @@ type fakeExecutor struct {
 	// deleteCalls records every Delete the fake was asked to run.
 	deleteCalls []deleteCall
 	deleteErr   error
+	// deleteCount plays the server-reported DeleteCount.
+	deleteCount int64
 }
 
 // writeCall is one recorded write.
@@ -48,19 +50,20 @@ type writeCall struct {
 	Upsert     bool
 }
 
-// deleteCall is one recorded delete.
+// deleteCall is one recorded delete: the collection and the filter the
+// caller lowered (nil expr = match everything).
 type deleteCall struct {
 	Collection string
-	PKs        []any
+	Expr       translate.Expr
 }
 
-// Delete implements store.Executor: records the keys it was asked to remove.
-func (f *fakeExecutor) Delete(ctx context.Context, collection string, pks []any) (store.WriteResult, error) {
+// Delete implements store.Executor: records the filter it was asked to run.
+func (f *fakeExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (store.WriteResult, error) {
 	if f.deleteErr != nil {
 		return store.WriteResult{}, f.deleteErr
 	}
-	f.deleteCalls = append(f.deleteCalls, deleteCall{Collection: collection, PKs: pks})
-	return store.WriteResult{Count: int64(len(pks))}, nil
+	f.deleteCalls = append(f.deleteCalls, deleteCall{Collection: collection, Expr: expr})
+	return store.WriteResult{Count: f.deleteCount}, nil
 }
 
 // Describe implements store.Executor from the fake's metas.
@@ -556,6 +559,6 @@ func (panickyExecutor) Upsert(ctx context.Context, collection string, rows []tra
 }
 
 // Delete implements store.Executor: the panic test only searches.
-func (panickyExecutor) Delete(ctx context.Context, collection string, pks []any) (store.WriteResult, error) {
+func (panickyExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (store.WriteResult, error) {
 	return store.WriteResult{}, nil
 }

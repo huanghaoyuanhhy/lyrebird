@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 // writeExec runs one write statement and returns the command tag; INSERT and
@@ -107,26 +108,29 @@ func TestUpdateReadModifyWrite(t *testing.T) {
 	}
 }
 
-func TestDeleteReadsKeysAndDeletes(t *testing.T) {
+func TestDeleteFiltersAndCounts(t *testing.T) {
 	for _, mode := range []string{"cache_statement", "simple_protocol"} {
 		t.Run(mode, func(t *testing.T) {
 			exec := testExecutor()
+			exec.deleteCount = 2
 			addr := startWireServer(t, exec)
 
 			tag := writeExec(t, addr, mode, "DELETE FROM items WHERE name <> 'none'")
 			if tag.String() != "DELETE 2" {
-				t.Fatalf("tag = %q", tag.String())
+				t.Fatalf("tag = %q, want the server's DeleteCount", tag.String())
 			}
-			if len(exec.deleteCalls) != 1 {
-				t.Fatalf("delete calls = %d", len(exec.deleteCalls))
+			if len(exec.deleteCalls) != 1 || exec.deleteCalls[0].Collection != "items" {
+				t.Fatalf("delete calls = %#v", exec.deleteCalls)
 			}
-			call := exec.deleteCalls[0]
-			if call.Collection != "items" {
-				t.Fatalf("collection = %q", call.Collection)
+			if exec.deleteCalls[0].Expr == nil {
+				t.Fatal("filtered delete sent a nil expr")
 			}
-			// the keys are the fetched rows' primary keys, in storage encoding
-			if len(call.PKs) != 2 || call.PKs[0] != int64(1) || call.PKs[1] != int64(2) {
-				t.Fatalf("pks = %#v", call.PKs)
+			rendered, err := translate.Render(exec.deleteCalls[0].Expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rendered == "" {
+				t.Fatalf("filtered delete rendered match-everything: %q", rendered)
 			}
 
 			// a constant-false WHERE never reaches the store
@@ -147,13 +151,35 @@ func TestDeleteReadsKeysAndDeletes(t *testing.T) {
 	}
 }
 
+func TestDeleteWithoutWhereDeletesEverything(t *testing.T) {
+	for _, mode := range []string{"cache_statement", "simple_protocol"} {
+		t.Run(mode, func(t *testing.T) {
+			exec := testExecutor()
+			exec.deleteCount = 2
+			addr := startWireServer(t, exec)
+
+			tag := writeExec(t, addr, mode, "DELETE FROM items")
+			if tag.String() != "DELETE 2" {
+				t.Fatalf("tag = %q", tag.String())
+			}
+			if len(exec.deleteCalls) != 1 {
+				t.Fatalf("delete calls = %d", len(exec.deleteCalls))
+			}
+			// no WHERE means match everything: the filter rides to the store
+			// as nil (the store renders the match-all form)
+			if exec.deleteCalls[0].Expr != nil {
+				t.Fatalf("expr = %v, want nil (match everything)", exec.deleteCalls[0].Expr)
+			}
+		})
+	}
+}
+
 func TestDeleteNamedRejections(t *testing.T) {
 	cases := []struct {
 		name string
 		sql  string
 		code string
 	}{
-		{"no where", "DELETE FROM items", "0A000"},
 		{"alias", "DELETE FROM items AS a WHERE a.id = 1", "0A000"},
 		{"using", "DELETE FROM items USING other WHERE items.id = 1", "0A000"},
 		{"schema-qualified", "DELETE FROM public.items WHERE id = 1", "0A000"},
@@ -170,7 +196,7 @@ func TestDeleteNamedRejections(t *testing.T) {
 	}
 }
 
-func TestWriteBeyondScanWindowRefuses(t *testing.T) {
+func TestUpdateBeyondScanWindowRefuses(t *testing.T) {
 	exec := testExecutor()
 	exec.result = &store.SearchResult{
 		Total: store.WriteScanLimit + 1,
@@ -178,15 +204,9 @@ func TestWriteBeyondScanWindowRefuses(t *testing.T) {
 	}
 	addr := startWireServer(t, exec)
 
-	pgErr := writeExpectError(t, addr, "simple_protocol", "DELETE FROM items WHERE name <> 'none'")
-	if pgErr.Code != "0A000" {
-		t.Fatalf("delete code = %s, want 0A000", pgErr.Code)
-	}
-	if len(exec.deleteCalls) != 0 {
-		t.Fatal("delete ran despite the over-window match count")
-	}
-
-	pgErr = writeExpectError(t, addr, "simple_protocol", "UPDATE items SET price = 1 WHERE name <> 'none'")
+	// UPDATE streams rows through the gateway (read-modify-write), so its
+	// window is a resource bound; DELETE deletes server-side and has none.
+	pgErr := writeExpectError(t, addr, "simple_protocol", "UPDATE items SET price = 1 WHERE name <> 'none'")
 	if pgErr.Code != "0A000" {
 		t.Fatalf("update code = %s, want 0A000", pgErr.Code)
 	}
