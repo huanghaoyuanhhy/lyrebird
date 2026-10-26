@@ -301,18 +301,120 @@ func (u *Update) Lower(schema translate.Schema) (set translate.WriteRow, plan *t
 		set[s.column] = v
 	}
 
-	plan = &translate.Plan{Source: translate.SourceFilter{FetchSource: true}}
-	w := fold(u.where)
-	if isFalse(w) {
-		plan.NoMatch = true
-		return set, plan, nil
-	}
-	expr, err := buildWhere(w, schema)
+	plan, err = lowerWhere(u.where, schema)
 	if err != nil {
 		return nil, nil, err
 	}
-	plan.Expr = expr
 	return set, plan, nil
+}
+
+// Delete is one parsed DELETE statement: the filter naming the rows to
+// remove. No WHERE clause is legal — it removes every row, the way
+// PostgreSQL defines it.
+type Delete struct {
+	Table string
+
+	// where is nil when the statement carries no WHERE clause (delete all).
+	where whereExpr
+}
+
+// ParseDelete compiles one DELETE statement. Both shapes are legal:
+// `DELETE FROM t WHERE …` names the rows, bare `DELETE FROM t` removes
+// everything.
+func ParseDelete(sql string) (*Delete, error) {
+	toks, err := lex(sql)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks}
+
+	if err := p.expectKeyword("DELETE"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+	t := p.peek()
+	if t.kind != tkIdent {
+		return nil, parseErrf("expected a table name after DELETE FROM, got %s", describe(t))
+	}
+	p.advance()
+	d := &Delete{Table: t.text}
+	if p.peekOp(".") {
+		return nil, unsupportedErrf("schema-qualified table names are not supported: use the bare collection name")
+	}
+	// DELETE FROM t AS a / DELETE FROM t a: no alias — the read path
+	// qualifies columns against one, and writes have no use for a second name.
+	if p.peekKeyword("AS") || p.peek().kind == tkIdent {
+		return nil, unsupportedErrf("DELETE aliases are not supported: qualify columns with the table name")
+	}
+	if p.peekKeyword("USING") {
+		return nil, unsupportedErrf("DELETE ... USING is not supported: writes are single-table")
+	}
+
+	if p.peekKeyword("WHERE") {
+		p.advance()
+		w, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		d.where = w
+	}
+	if err := writeStatementEnd(p, "DELETE"); err != nil {
+		return nil, err
+	}
+
+	// qualifiers: columns may be written as items.status; anything else
+	// names a second table
+	if d.where != nil {
+		strip := func(col string) (string, error) {
+			qual, name, dotted := strings.Cut(col, ".")
+			if !dotted {
+				return col, nil
+			}
+			if qual == d.Table {
+				return name, nil
+			}
+			return "", unsupportedErrf("column reference [%s] names another table: writes are single-table", col)
+		}
+		where, err := stripWhereQualifiers(d.where, strip)
+		if err != nil {
+			return nil, err
+		}
+		d.where = where
+	}
+	return d, nil
+}
+
+// Lower folds the WHERE into the filter the store deletes by. A nil filter
+// matches everything; a constant-false WHERE lowers to a NoMatch plan
+// (nothing to delete, zero round trips).
+func (d *Delete) Lower(schema translate.Schema) (*translate.Plan, error) {
+	if schema == nil {
+		schema = translate.MapSchema{}
+	}
+	if d.where == nil {
+		return &translate.Plan{}, nil
+	}
+	return lowerWhere(d.where, schema)
+}
+
+// lowerWhere folds one WHERE expression and lowers it into the filter plan
+// the write statement executes to find its rows. A constant-false WHERE
+// lowers to a NoMatch plan (zero round trips, nothing written).
+func lowerWhere(w whereExpr, schema translate.Schema) (*translate.Plan, error) {
+	plan := &translate.Plan{Source: translate.SourceFilter{FetchSource: true}}
+	folded := fold(w)
+	if isFalse(folded) {
+		plan.NoMatch = true
+		return plan, nil
+	}
+	expr, err := buildWhere(folded, schema)
+	if err != nil {
+		return nil, err
+	}
+	plan.Expr = expr
+	return plan, nil
 }
 
 // writeLiteral maps one SQL literal onto the write value vocabulary for the
