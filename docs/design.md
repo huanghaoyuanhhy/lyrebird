@@ -473,9 +473,12 @@ DDL remains a separate later slice).
   across three CI runs as the picture sharpened): exact for real matches in
   every state (1 for an existing key, N for an N-row filter, flushed or
   growing, in-list and equality forms); exact 0 for an absent key after a
-  flush; but **unstable for an absent key in the growing state** — one
-  matrix run observed deleted=1 for a never-existing key where the probe
-  reports 0, unreproducible since. Consequences, in order of hardness:
+  flush; but **one observed instability for an absent key in the growing state** — a
+  matrix run reported deleted=1 for a never-existing key where the probe
+  reports 0; a dedicated repro under the exact matrix conditions (freshly
+  recreated collection, unflushed insert, equality form, three tries)
+  failed to reproduce it, so it is archived as a one-off observation while
+  nothing depends on the count for absent keys. Consequences, in order of hardness:
   (1) behavior contracts decided on the count (ES not_found) must run on a
   Strong snapshot instead — DELETE /_doc/{id} pre-checks existence with the
   point search and skips Delete entirely when invisible, because the
