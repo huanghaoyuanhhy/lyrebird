@@ -162,6 +162,10 @@ func TestPgserverWriteE2E(t *testing.T) {
 	})
 
 	t.Run("delete without where removes everything", func(t *testing.T) {
+		// clear the rows earlier subtests left, then work on a known set
+		if _, err := conn.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE id < 100", table)); err != nil {
+			t.Fatalf("clear: %v", err)
+		}
 		tag, err := conn.Exec(ctx,
 			fmt.Sprintf("INSERT INTO %s (id, name, price, active, emb) VALUES (31, 'all-a', 1, true, '[1, 1]'), (32, 'all-b', 2, false, '[0, 1]')", table))
 		if err != nil {
@@ -171,13 +175,14 @@ func TestPgserverWriteE2E(t *testing.T) {
 			t.Fatalf("insert tag = %q", tag.String())
 		}
 
-		// the bare statement is legal PostgreSQL and deletes every row
+		// the bare statement is legal PostgreSQL and deletes every row; the
+		// tag is exact (a count(*) snapshot taken before the delete)
 		tag, err = conn.Exec(ctx, fmt.Sprintf("DELETE FROM %s", table))
 		if err != nil {
 			t.Fatalf("delete: %v", err)
 		}
 		if tag.String() != "DELETE 2" {
-			t.Fatalf("tag = %q, want DELETE 2 (server DeleteCount)", tag.String())
+			t.Fatalf("tag = %q, want DELETE 2", tag.String())
 		}
 		waitGone(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s WHERE id = 31 LIMIT 1", table))
 		waitGone(t, ctx, conn, fmt.Sprintf("SELECT id FROM %s WHERE id = 32 LIMIT 1", table))

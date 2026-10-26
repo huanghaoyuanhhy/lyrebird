@@ -468,6 +468,14 @@ DDL remains a separate later slice).
   (read-modify-write), so the window is a resource bound there, not a
   policy gate — and beyond-window UPDATEs refuse rather than silently
   rewriting a prefix (that fix stays).
+- **Delete counts are a count(*) snapshot, not Milvus's DeleteCount**
+  (first CI run's finding, 2026-10-26): the server's delete statistic is
+  best-effort — re-deleting an already-deleted primary key reported 1,
+  and a match-all over 6 rows reported 5 — so DeleteCount can neither
+  decide ES's not_found envelope nor fill PG's `DELETE n`. The store takes
+  a count(*) just before the delete (the ES snapshot-reporting semantics)
+  and uses it for every reported figure; DeleteCount is the fallback only
+  when the count fails.
 - **pk/autoID policy**: this settles the 2026-09-18 proposal's key
   question for the current surface — pk is client-owned unless the
   schema says AutoID (then it is store-owned, always); ES _id and the
