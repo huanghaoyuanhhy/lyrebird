@@ -122,6 +122,50 @@ func TestMilvusDeleteCountProbe(t *testing.T) {
 			t.Fatalf("post-delete count = %d, want 0", n)
 		}
 	})
+
+	// The growing-segment half of the probe: same questions, but nothing
+	// flushed since the inserts — the state every live client actually
+	// operates in between flushes. Measured earlier (first CI run): a
+	// re-delete over a tombstone in the growing state reported 1 where the
+	// flushed probe reports 0, and matrix deletes of a never-existing key
+	// reported 1 where the flushed probe reports 0. These assertions pin
+	// the flushed-exact hypothesis; a failure prints the growing numbers.
+	t.Run("growing: delete a never-existing key", func(t *testing.T) {
+		if n := countByFilter("id in [9998]"); n != 0 {
+			t.Fatalf("precondition: count = %d, want 0", n)
+		}
+		if got := deleteByExpr("id in [9998]"); got != 0 {
+			t.Fatalf("growing DeleteCount = %d, want 0 (flushed probe reports 0; growing reported this number instead)", got)
+		}
+	})
+
+	t.Run("growing: re-delete over a growing tombstone", func(t *testing.T) {
+		if n := countByFilter("id in [9001]"); n != 1 {
+			t.Fatalf("precondition: count = %d, want 1", n)
+		}
+		if got := deleteByExpr("id in [9001]"); got != 1 {
+			t.Fatalf("growing delete = %d, want 1", got)
+		}
+		if n := countByFilter("id in [9001]"); n != 0 {
+			t.Fatalf("post-delete count = %d, want 0", n)
+		}
+		// no flush in between: the tombstone lives in a growing segment
+		if got := deleteByExpr("id in [9001]"); got != 0 {
+			t.Fatalf("growing re-delete DeleteCount = %d, want 0 (flushed probe reports 0; growing reported this number instead)", got)
+		}
+	})
+
+	t.Run("flushed again: exactness returns", func(t *testing.T) {
+		if _, err := cli.Flush(ctx, milvusclient.NewFlushOption(coll)); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		if got := deleteByExpr("id in [9001]"); got != 0 {
+			t.Fatalf("flushed re-delete DeleteCount = %d, want 0", got)
+		}
+		if got := deleteByExpr("id in [9998]"); got != 0 {
+			t.Fatalf("flushed never-existing DeleteCount = %d, want 0", got)
+		}
+	})
 }
 
 func joinInts(ids []int64) string {
