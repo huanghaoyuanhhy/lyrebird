@@ -304,8 +304,8 @@ func TestBulkRefused(t *testing.T) {
 
 func TestDeleteDocumentById(t *testing.T) {
 	exec := &fakeExecutor{
-		metas:       []catalog.CollectionMeta{writeMeta},
-		deleteCount: 1,
+		metas:  []catalog.CollectionMeta{writeMeta},
+		result: &store.SearchResult{Total: 1, Hits: []store.Hit{{ID: "7", Source: map[string]any{"id": int64(7)}}}},
 	}
 	srv := writeServer(t, exec)
 
@@ -324,11 +324,15 @@ func TestDeleteDocumentById(t *testing.T) {
 		t.Fatalf("filter = %q, want the pk-membership form", rendered)
 	}
 
-	// the server's count decides the envelope: nothing removed = not_found 404
-	exec.deleteCount = 0
+	// the not_found decision runs on the existence pre-check: nothing
+	// visible means 404, and no delete call at all
+	exec.result = &store.SearchResult{}
 	status, body = doJSON(t, srv, "DELETE", "/items/_doc/999", "")
 	if status != http.StatusNotFound || body["result"] != "not_found" {
 		t.Fatalf("missing status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatalf("missing doc ran a delete: %#v", exec.deleteCalls)
 	}
 
 	// a non-numeric id for a numeric key is a 400

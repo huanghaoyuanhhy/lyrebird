@@ -234,9 +234,13 @@ func (s *Server) updateDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteDocument handles DELETE /{index}/_doc/{id}: remove the row the
-// primary key addresses. One round trip — the delete runs, and the server's
-// count decides the envelope: nothing removed means the document was not
-// there, the ES not_found answer (also the honest one under concurrency).
+// primary key addresses. The not_found decision runs on an existence
+// pre-check (a Strong-consistency point search), not on the delete's own
+// count: Milvus's delete resolves its expression on a bounded snapshot
+// that lags Strong reads — measured in CI, a re-delete of an
+// already-tombstoned key still reported a count of 1 after a Strong query
+// had stopped returning it — so DeleteCount cannot decide a 404/200
+// behavior contract. The delete itself stays one call.
 func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 	logger := s.zapLogger()
 	index := r.PathValue("index")
@@ -254,6 +258,18 @@ func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 		s.writeRequestError(logger, w, err, index)
 		return
 	}
+	if _, exists, err := s.fetchDocument(r, index, pk, pkValue(pk, parsed)); err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	} else if !exists {
+		logger.Info("es delete",
+			zap.String("index", index),
+			zap.String("id", id),
+			zap.String("result", "not_found"),
+			zap.Duration("took", time.Since(start)))
+		writeDeleteResponse(w, index, id, "not_found")
+		return
+	}
 	deleted, err := s.cluster.Delete(r.Context(), index, translate.InList{
 		Field:  pk.Name,
 		Values: []translate.Value{pkValue(pk, parsed)},
@@ -263,16 +279,12 @@ func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 		s.writeWriteError(logger, w, err, index)
 		return
 	}
-	result := "deleted"
-	if deleted.Count == 0 {
-		result = "not_found"
-	}
 	logger.Info("es delete",
 		zap.String("index", index),
 		zap.String("id", id),
 		zap.Int64("deleted", deleted.Count),
 		zap.Duration("took", time.Since(start)))
-	writeDeleteResponse(w, index, id, result)
+	writeDeleteResponse(w, index, id, "deleted")
 }
 
 // writeDeleteResponse emits the DELETE /_doc/{id} envelope: 200 with
