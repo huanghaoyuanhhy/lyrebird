@@ -9,6 +9,7 @@ import (
 
 	"github.com/milvus-io/milvus/client/v3/column"
 	"github.com/milvus-io/milvus/client/v3/entity"
+	"github.com/milvus-io/milvus/client/v3/index"
 	"github.com/milvus-io/milvus/client/v3/milvusclient"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/milvustest"
@@ -186,4 +187,135 @@ func joinInts(ids []int64) string {
 		parts[i] = fmt.Sprint(v)
 	}
 	return strings.Join(parts, ",")
+}
+
+// reproShape recreates name with the write-path fixture shape (the same
+// schema milvustest.Seed builds for lyrebird_e2e_write) and leaves it
+// empty, flushed, indexed, and loaded — the state a matrix scenario's
+// reset produces before its first unflushed insert.
+func reproShape(ctx context.Context, cli *milvusclient.Client, name string) error {
+	has, err := cli.HasCollection(ctx, milvusclient.NewHasCollectionOption(name))
+	if err != nil {
+		return err
+	}
+	if has {
+		if err := cli.DropCollection(ctx, milvusclient.NewDropCollectionOption(name)); err != nil {
+			return err
+		}
+	}
+	schema := entity.NewSchema().
+		WithName(name).
+		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
+		WithField(entity.NewField().WithName("name").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32)).
+		WithField(entity.NewField().WithName("price").WithDataType(entity.FieldTypeDouble)).
+		WithField(entity.NewField().WithName("active").WithDataType(entity.FieldTypeBool)).
+		WithField(entity.NewField().WithName("note").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32).WithNullable(true)).
+		WithField(entity.NewField().WithName("emb").WithDataType(entity.FieldTypeFloatVector).WithDim(2))
+	if err := cli.CreateCollection(ctx, milvusclient.NewCreateCollectionOption(name, schema).WithShardNum(1)); err != nil {
+		return err
+	}
+	if _, err := cli.Flush(ctx, milvusclient.NewFlushOption(name)); err != nil {
+		return err
+	}
+	_, err = cli.CreateIndex(ctx, milvusclient.NewCreateIndexOption(name, "emb", index.NewAutoIndex(entity.L2)))
+	if err != nil {
+		return err
+	}
+	task, err := cli.LoadCollection(ctx, milvusclient.NewLoadCollectionOption(name))
+	if err != nil {
+		return err
+	}
+	return task.Await(ctx)
+}
+
+// TestMilvusDeleteAbsentKeyRepro reproduces the matrix anomaly's exact
+// conditions, which the main probe does not cover: WriteCollection's data
+// segments are flushed by the probe, so its "growing" measurements only
+// ever had unflushed delete deltas. The matrix ran against a freshly
+// recreated collection holding one *unflushed insert*, and deleting a
+// never-existing key reported DeleteCount=1 there once. This test rebuilds
+// exactly that state three times (fresh WriteShape collection, unflushed
+// insert made visible via Strong queries, delete an absent key) and fails
+// with the observed numbers if the anomaly reproduces.
+func TestMilvusDeleteAbsentKeyRepro(t *testing.T) {
+	cfg, ok := milvustest.FromEnv()
+	if !ok {
+		t.Skipf("set %s and %s to run the Milvus e2e suite", milvustest.URIEnv, milvustest.TokenEnv)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cli, err := milvustest.Connect(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer cli.Close(ctx)
+
+	const coll = "lyrebird_e2e_wp_repro"
+	t.Cleanup(func() {
+		_ = cli.DropCollection(context.Background(), milvusclient.NewDropCollectionOption(coll))
+	})
+
+	insertOne := func(id int64) {
+		t.Helper()
+		_, err := cli.Insert(ctx, milvusclient.NewColumnBasedInsertOption(coll,
+			column.NewColumnInt64("id", []int64{id}),
+			column.NewColumnVarChar("name", []string{"repro"}),
+			column.NewColumnDouble("price", []float64{1}),
+			column.NewColumnBool("active", []bool{true}),
+			column.NewColumnVarChar("note", []string{""}),
+			column.NewColumnFloatVector("emb", 2, [][]float32{{1, 1}})))
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		// deliberately no flush: the row must live in the growing segment
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			rs, err := cli.Query(ctx, milvusclient.NewQueryOption(coll).
+				WithFilter(fmt.Sprintf("id == %d", id)).
+				WithOutputFields("count(*)").
+				WithConsistencyLevel(entity.ClStrong))
+			if err != nil {
+				t.Fatalf("visibility poll: %v", err)
+			}
+			col := rs.GetColumn("count(*)")
+			if col != nil && col.Len() > 0 {
+				if v, err := col.Get(0); err == nil {
+					if n, _ := v.(int64); n == 1 {
+						return
+					}
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("inserted row never became visible")
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	deleteExpr := func(expr string) int64 {
+		t.Helper()
+		res, err := cli.Delete(ctx, milvusclient.NewDeleteOption(coll).WithExpr(expr))
+		if err != nil {
+			t.Fatalf("delete %q: %v", expr, err)
+		}
+		return res.DeleteCount
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := reproShape(ctx, cli, coll); err != nil {
+			t.Fatalf("iter %d: rebuild fixture: %v", i, err)
+		}
+		insertOne(int64(100 + i))
+
+		if got := deleteExpr("id == 999"); got != 0 {
+			t.Fatalf("iter %d: absent key, equality form, over an unflushed insert: DeleteCount = %d, want 0 (the matrix anomaly)", i, got)
+		}
+		if got := deleteExpr("id in [999]"); got != 0 {
+			t.Fatalf("iter %d: absent key, in form, over an unflushed insert: DeleteCount = %d, want 0", i, got)
+		}
+		if got := deleteExpr(fmt.Sprintf("id == %d", 100+i)); got != 1 {
+			t.Fatalf("iter %d: existing unflushed row: DeleteCount = %d, want 1", i, got)
+		}
+	}
 }
