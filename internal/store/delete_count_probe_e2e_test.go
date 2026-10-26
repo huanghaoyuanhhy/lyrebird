@@ -139,6 +139,15 @@ func TestMilvusDeleteCountProbe(t *testing.T) {
 		}
 	})
 
+	t.Run("growing: delete a never-existing key, equality form", func(t *testing.T) {
+		// run 3's matrix anomaly: the ES term translation renders `id == 999`
+		// (equality), the probe so far only measured `id in [9998]`. Measure
+		// the equality form directly in the same growing state.
+		if got := deleteByExpr("id == 9998"); got != 0 {
+			t.Fatalf("growing equality DeleteCount = %d, want 0 (in-form reports 0; equality reported this instead)", got)
+		}
+	})
+
 	t.Run("growing: re-delete over a growing tombstone", func(t *testing.T) {
 		if n := countByFilter("id in [9001]"); n != 1 {
 			t.Fatalf("precondition: count = %d, want 1", n)
@@ -164,6 +173,9 @@ func TestMilvusDeleteCountProbe(t *testing.T) {
 		}
 		if got := deleteByExpr("id in [9998]"); got != 0 {
 			t.Fatalf("flushed never-existing DeleteCount = %d, want 0", got)
+		}
+		if got := deleteByExpr("id == 9998"); got != 0 {
+			t.Fatalf("flushed never-existing equality DeleteCount = %d, want 0", got)
 		}
 	})
 }
