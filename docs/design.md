@@ -469,23 +469,31 @@ DDL remains a separate later slice).
   policy gate — and beyond-window UPDATEs refuse rather than silently
   rewriting a prefix (that fix stays).
 - **Delete counts are Milvus's own DeleteCount** (probed directly with the
-  raw SDK, `TestMilvusDeleteCountProbe`, kept as the pin): on settled data
-  the server statistic is exact — an existing key deletes 1, a re-deleted
-  key deletes 0, an N-row filter deletes N. An earlier count(*)
-  pre-query was removed: it added a second filter evaluation without
-  buying any correctness (it reads the same snapshots the delete
-  resolves against). One window does exist and is a platform fact: the
-  delete's expression resolution runs on a bounded snapshot (the SDK
-  exposes no consistency setting for Delete), so a delete issued
-  milliseconds after the write it targets can miss it — first CI run's
-  two anomalies (a re-delete reporting 1, a match-all over 6 rows
-  reporting 5) were both this window, not statistic inaccuracy. Clients
-  that need a write to be deleted must let it become visible first, the
-  same read-your-writes window every read here polls; real
-  Elasticsearch's `_delete_by_query` without `refresh` has the same
-  default shape, and on the PG side it is the standing no-transactions
-  limitation. The e2e suites therefore settle writes (waitVisible /
-  waitGone) before asserting delete counts.
+  raw SDK, `TestMilvusDeleteCountProbe`, kept as the pin — the probe grew
+  across three CI runs as the picture sharpened): exact for real matches in
+  every state (1 for an existing key, N for an N-row filter, flushed or
+  growing, in-list and equality forms); exact 0 for an absent key after a
+  flush; but **unstable for an absent key in the growing state** — one
+  matrix run observed deleted=1 for a never-existing key where the probe
+  reports 0, unreproducible since. Consequences, in order of hardness:
+  (1) behavior contracts decided on the count (ES not_found) must run on a
+  Strong snapshot instead — DELETE /_doc/{id} pre-checks existence with the
+  point search and skips Delete entirely when invisible, because the
+  delete's own resolution runs on a bounded snapshot that lags Strong reads
+  (measured: a re-delete reported 1 even after a Strong query had stopped
+  returning the id; the probe stays green only because it flushes first);
+  (2) reported figures (DELETE n / deleted:N) ride DeleteCount — an earlier
+  count(*) pre-query was removed as a second filter evaluation that bought
+  no correctness (it reads the same snapshots); (3) cross-entry judging
+  (the write parity matrix) compares the two entries' counts against each
+  other, never against an absolute zero, with the state comparison as the
+  strong check. The bounded-snapshot window itself is a platform fact
+  clients must respect: a delete issued milliseconds after the write it
+  targets can miss it — the same read-your-writes window every read here
+  polls; real Elasticsearch's `_delete_by_query` without `refresh` has the
+  same default shape, and on the PG side it is the standing
+  no-transactions limitation. The e2e suites therefore settle writes
+  (waitVisible / waitGone) before asserting delete counts.
 - **pk/autoID policy**: this settles the 2026-09-18 proposal's key
   question for the current surface — pk is client-owned unless the
   schema says AutoID (then it is store-owned, always); ES _id and the
