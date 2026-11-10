@@ -24,10 +24,11 @@ import (
 )
 
 // installWriteRoutes registers the document write APIs: the index API
-// (PUT/POST _doc, _create) and the partial-update API (_update). All of
-// them run the strict write path: a document that does not match the
-// index's live mapping is rejected, never coerced, never dynamically
-// mapped (docs/design.md, write path).
+// (PUT/POST _doc, _create), the partial-update API (_update), and the
+// delete APIs (DELETE _doc/{id}, _delete_by_query). All of them run the
+// strict write path: a document that does not match the index's live
+// mapping is rejected, never coerced, never dynamically mapped
+// (docs/design.md, write path).
 func (s *Server) installWriteRoutes() {
 	s.mux.HandleFunc("PUT /{index}/_doc", s.indexDocument)
 	s.mux.HandleFunc("POST /{index}/_doc", s.indexDocument)
@@ -37,6 +38,8 @@ func (s *Server) installWriteRoutes() {
 	s.mux.HandleFunc("POST /{index}/_create/{id}", s.createDocument)
 	s.mux.HandleFunc("PUT /{index}/_update/{id}", s.updateDocument)
 	s.mux.HandleFunc("POST /{index}/_update/{id}", s.updateDocument)
+	s.mux.HandleFunc("DELETE /{index}/_doc/{id}", s.deleteDocument)
+	s.mux.HandleFunc("POST /{index}/_delete_by_query", s.deleteByQuery)
 
 	// _bulk would batch the same calls, but its ndjson envelope deserves
 	// its own pass; fail with the name rather than a 404.
@@ -228,6 +231,184 @@ func (s *Server) updateDocument(w http.ResponseWriter, r *http.Request) {
 		zap.String("result", result),
 		zap.Duration("took", time.Since(start)))
 	writeIndexResponse(w, index, id, result)
+}
+
+// deleteDocument handles DELETE /{index}/_doc/{id}: remove the row the
+// primary key addresses. The not_found decision runs on an existence
+// pre-check (a Strong-consistency point search), not on the delete's own
+// count: Milvus's delete resolves its expression on a bounded snapshot
+// that lags Strong reads — measured in CI, a re-delete of an
+// already-tombstoned key still reported a count of 1 after a Strong query
+// had stopped returning it — so DeleteCount cannot decide a 404/200
+// behavior contract. The delete itself stays one call.
+func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
+	logger := s.zapLogger()
+	index := r.PathValue("index")
+	id := r.PathValue("id")
+	start := time.Now()
+
+	meta, err := s.cluster.Collection(r.Context(), "", index)
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	pk := primaryKeyOf(meta)
+	parsed, err := parseDocumentID(pk, id)
+	if err != nil {
+		s.writeRequestError(logger, w, err, index)
+		return
+	}
+	if _, exists, err := s.fetchDocument(r, index, pk, pkValue(pk, parsed)); err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	} else if !exists {
+		logger.Info("es delete",
+			zap.String("index", index),
+			zap.String("id", id),
+			zap.String("result", "not_found"),
+			zap.Duration("took", time.Since(start)))
+		writeDeleteResponse(w, index, id, "not_found")
+		return
+	}
+	deleted, err := s.cluster.Delete(r.Context(), index, translate.InList{
+		Field:  pk.Name,
+		Values: []translate.Value{pkValue(pk, parsed)},
+	})
+	if err != nil {
+		logger.Error("delete execution failed", zap.String("index", index), zap.Error(err))
+		s.writeWriteError(logger, w, err, index)
+		return
+	}
+	logger.Info("es delete",
+		zap.String("index", index),
+		zap.String("id", id),
+		zap.Int64("deleted", deleted.Count),
+		zap.Duration("took", time.Since(start)))
+	writeDeleteResponse(w, index, id, "deleted")
+}
+
+// writeDeleteResponse emits the DELETE /_doc/{id} envelope: 200 with
+// result=deleted, 404 with result=not_found.
+func writeDeleteResponse(w http.ResponseWriter, index, id, result string) {
+	status := http.StatusOK
+	if result == "not_found" {
+		status = http.StatusNotFound
+	}
+	writeJSON(w, status, map[string]any{
+		"_index":        index,
+		"_id":           id,
+		"_version":      1,
+		"result":        result,
+		"_shards":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+		"_seq_no":       0,
+		"_primary_term": 1,
+		"status":        status,
+	})
+}
+
+// deleteByQuery handles POST /{index}/_delete_by_query: translate the query
+// DSL into the shared filter dialect and hand it to the store — Milvus
+// resolves the matching primary keys and deletes server-side, exactly what
+// the ES statement means. Every document matching (match_all) is legal, as
+// in Elasticsearch; knn stays refused (the delete expression is scalar).
+func (s *Server) deleteByQuery(w http.ResponseWriter, r *http.Request) {
+	logger := s.zapLogger()
+	index := r.PathValue("index")
+	start := time.Now()
+
+	if err := rejectDeleteParams(r); err != nil {
+		writeUnsupported(w, err.Error())
+		return
+	}
+	body, err := requestBody(r)
+	if err != nil {
+		writeUnsupported(w, err.Error())
+		return
+	}
+	var top map[string]json.RawMessage
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&top); err != nil {
+		writeErrorEnvelope(w, http.StatusBadRequest, "parsing_exception",
+			"the _delete_by_query body is not valid JSON: "+err.Error(), index)
+		return
+	}
+	qraw, ok := top["query"]
+	if !ok {
+		writeErrorEnvelope(w, http.StatusBadRequest, "parsing_exception",
+			"the _delete_by_query body needs a [query] member naming the documents to delete", index)
+		return
+	}
+
+	schema, err := s.cluster.Schema(r.Context(), index)
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	// the query member rides the search translator: wrap it in the search
+	// body shape the translator reads
+	wrapper, err := json.Marshal(map[string]json.RawMessage{"query": qraw})
+	if err != nil {
+		s.writeExecError(logger, w, index, err)
+		return
+	}
+	plan, err := es.Translate(wrapper, schema)
+	if err != nil {
+		s.writeTranslateError(logger, w, err)
+		return
+	}
+	if plan.Search != nil {
+		writeUnsupported(w, "a vector search as the _delete_by_query query")
+		return
+	}
+	if plan.NoMatch {
+		// match_none (or a folded constant-false shape): nothing to delete,
+		// zero round trips
+		writeDeleteByQueryResponse(w, start, 0, 0)
+		return
+	}
+	deleted, err := s.cluster.Delete(r.Context(), index, plan.Expr)
+	if err != nil {
+		logger.Error("delete_by_query execution failed", zap.String("index", index), zap.Error(err))
+		s.writeWriteError(logger, w, err, index)
+		return
+	}
+	logger.Info("es delete_by_query",
+		zap.String("index", index),
+		zap.Int64("deleted", deleted.Count),
+		zap.Duration("took", time.Since(start)))
+	writeDeleteByQueryResponse(w, start, deleted.Count, deleted.Count)
+}
+
+// writeDeleteByQueryResponse emits the _delete_by_query envelope. total and
+// deleted carry the server's count twice: the delete is one server-side
+// evaluation, so "matched" and "removed" are the same number here — the
+// two figures only diverge in ES when version conflicts skip documents.
+func writeDeleteByQueryResponse(w http.ResponseWriter, start time.Time, total, deleted int64) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"took":                   time.Since(start).Milliseconds(),
+		"timed_out":              false,
+		"total":                  total,
+		"deleted":                deleted,
+		"batches":                1,
+		"version_conflicts":      0,
+		"noops":                  0,
+		"retries":                map[string]any{"bulk": 0, "search": 0},
+		"throttled_millis":       0,
+		"requests_per_second":    -1.0,
+		"throttled_until_millis": 0,
+		"failures":               []any{},
+	})
+}
+
+// rejectDeleteParams refuses the one _delete_by_query parameter that would
+// change the result if ignored (max_docs caps the deletion — silence would
+// report deleted:N when fewer documents were actually removed). The timing
+// knobs are accepted and ignored: they shape delivery, not which documents
+// are deleted.
+func rejectDeleteParams(r *http.Request) error {
+	if r.URL.Query().Has("max_docs") {
+		return fmt.Errorf("the max_docs parameter (bounded deletion)")
+	}
+	return nil
 }
 
 // parseDocumentID turns the URL id into the primary key's storage shape:

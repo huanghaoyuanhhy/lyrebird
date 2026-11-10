@@ -96,15 +96,16 @@ func Seed(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// seedWrite rebuilds the write-path fixtures, all empty: the suites insert
-// through lyrebird itself and read back.
+// WriteShape recreates `name` with the write-path fixture shape —
 //
-//	lyrebird_e2e_write: id (int64 pk), name, price, active, note (null), emb (dim 2)
-//	lyrebird_e2e_autoid: id (int64 pk, auto-generated), v
-//	lyrebird_e2e_strpk:  id (varchar pk), v
-func seedWrite(ctx context.Context, cli *milvusclient.Client) error {
-	if err := recreate(ctx, cli, WriteCollection, entity.NewSchema().
-		WithName(WriteCollection).
+//	id (int64 pk), name, price, active, note (nullable), emb (dim 2, L2)
+//
+// — and leaves it empty, loaded, and indexed. The write suites seed the
+// standard fixture with it; the write parity matrix builds its twin
+// collections from it, one per protocol entry.
+func WriteShape(ctx context.Context, cli *milvusclient.Client, name string) error {
+	if err := recreate(ctx, cli, name, entity.NewSchema().
+		WithName(name).
 		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
 		WithField(entity.NewField().WithName("name").WithDataType(entity.FieldTypeVarChar).WithMaxLength(32)).
 		WithField(entity.NewField().WithName("price").WithDataType(entity.FieldTypeDouble)).
@@ -113,7 +114,17 @@ func seedWrite(ctx context.Context, cli *milvusclient.Client) error {
 		WithField(entity.NewField().WithName("emb").WithDataType(entity.FieldTypeFloatVector).WithDim(2))); err != nil {
 		return err
 	}
-	if err := finalize(ctx, cli, WriteCollection, "emb", entity.L2); err != nil {
+	return finalize(ctx, cli, name, "emb", entity.L2)
+}
+
+// seedWrite rebuilds the write-path fixtures, all empty: the suites insert
+// through lyrebird itself and read back.
+//
+//	lyrebird_e2e_write: id (int64 pk), name, price, active, note (null), emb (dim 2)
+//	lyrebird_e2e_autoid: id (int64 pk, auto-generated), v
+//	lyrebird_e2e_strpk:  id (varchar pk), v
+func seedWrite(ctx context.Context, cli *milvusclient.Client) error {
+	if err := WriteShape(ctx, cli, WriteCollection); err != nil {
 		return err
 	}
 

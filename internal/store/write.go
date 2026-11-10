@@ -89,6 +89,76 @@ func (e *MilvusExecutor) Upsert(ctx context.Context, collection string, rows []t
 	return e.write(ctx, collection, rows, true)
 }
 
+// WriteScanLimit bounds how many rows one UPDATE's read-modify-write may
+// stream through the gateway: it scans whole rows and upserts each, so the
+// window is a gateway resource bound, not a policy gate. DELETE does not
+// stream rows (the filter deletes server-side), so it has no window.
+const WriteScanLimit = 10000
+
+// Delete removes every row the filter matches, server-side: the expression
+// renders in the same dialect the read path filters with, Milvus resolves
+// the matching primary keys and writes tombstones, and the reported count
+// is the server's DeleteCount. A nil expr matches everything — rendered as
+// `pk is not null` (the primary key is never null) because Milvus's delete,
+// unlike its query, does not read an empty expression as match-all.
+//
+// DeleteCount measured exact on settled data (raw-SDK probe on v3.0.2, kept
+// as TestMilvusDeleteCountProbe: an existing key deletes 1, a re-deleted
+// key deletes 0, an N-row filter deletes N). One window does exist and is
+// a platform fact, not a statistic flaw: the delete's expression resolution
+// runs on a bounded snapshot — the SDK exposes no consistency setting for
+// Delete — so a delete issued milliseconds after the write it targets can
+// miss it (observed: a re-delete reporting 1 for an already-tombstoned
+// key, a match-all over 6 rows reporting 5). Clients that need a write to
+// be deleted must let it become visible first, the same read-your-writes
+// window every read here already polls for; real Elasticsearch's
+// _delete_by_query without refresh has the same shape by default.
+func (e *MilvusExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (WriteResult, error) {
+	filter := expr
+	if filter == nil {
+		coll, err := e.describe(ctx, collection)
+		if err != nil {
+			return WriteResult{}, err
+		}
+		pk := primaryKey(coll.Schema.Fields)
+		if pk == nil {
+			return WriteResult{}, fmt.Errorf("collection %q has no primary key field", collection)
+		}
+		filter = translate.NotNull{Field: pk.Name}
+	}
+	rendered, err := translate.Render(filter)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("render delete filter for collection %q: %w", collection, err)
+	}
+
+	res, err := e.deleteOpt(ctx, collection, milvusclient.NewDeleteOption(collection).WithExpr(rendered))
+	if err != nil {
+		return WriteResult{}, err
+	}
+	return WriteResult{Count: res.DeleteCount}, nil
+}
+
+// deleteOpt runs one delete call, retrying once behind an auto-load:
+// deletes are DML like reads, and Milvus refuses them against unloaded
+// collections the same way.
+func (e *MilvusExecutor) deleteOpt(ctx context.Context, collection string, opt milvusclient.DeleteOption) (milvusclient.DeleteResult, error) {
+	res, err := e.cli.Delete(ctx, opt)
+	if err == nil {
+		return res, nil
+	}
+	if !strings.Contains(err.Error(), "not loaded") {
+		return milvusclient.DeleteResult{}, fmt.Errorf("delete from collection %q: %w", collection, err)
+	}
+	if err := e.loadAndWait(ctx, collection); err != nil {
+		return milvusclient.DeleteResult{}, fmt.Errorf("auto-load collection %q: %w", collection, err)
+	}
+	res, err = e.cli.Delete(ctx, opt)
+	if err != nil {
+		return milvusclient.DeleteResult{}, fmt.Errorf("delete from collection %q after auto-load: %w", collection, err)
+	}
+	return res, nil
+}
+
 // write is the shared body of Insert and Upsert: validate strictly, build
 // one column per non-autoID field, send.
 func (e *MilvusExecutor) write(ctx context.Context, collection string, rows []translate.WriteRow, upsert bool) (WriteResult, error) {

@@ -148,8 +148,8 @@ func (s *Server) parseOne(ctx context.Context, query string) (wire.PreparedState
 		}
 	}
 
-	// 3. write statements: INSERT / UPDATE, the parallel write lane (the
-	// design's narrow path — write rows, not read plans). Parsing is
+	// 3. write statements: INSERT / UPDATE / DELETE, the parallel write lane
+	// (the design's narrow path — write rows, not read plans). Parsing is
 	// schema-free; the statement body resolves the schema when executed.
 	if words, err := catalog.Words(query); err == nil && len(words) > 0 {
 		switch strings.ToUpper(words[0]) {
@@ -175,6 +175,17 @@ func (s *Server) parseOne(ctx context.Context, query string) (wire.PreparedState
 				return nil, wireError(err)
 			}
 			return wire.Prepared(wire.NewStatement(s.writeUpdateStatement(exec, upd))), nil
+		case "DELETE":
+			del, err := pg.ParseDelete(query)
+			if err != nil {
+				logger.Warn("pg delete rejected", zap.Error(err))
+				return nil, wireError(err)
+			}
+			exec, err := s.databaseView(ctx)
+			if err != nil {
+				return nil, wireError(err)
+			}
+			return wire.Prepared(wire.NewStatement(s.writeDeleteStatement(exec, del))), nil
 		}
 	}
 

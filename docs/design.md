@@ -441,6 +441,62 @@ DDL remains a separate later slice).
   name. Execution is read-modify-write: fetch every match (whole rows,
   capped at the same 10000 window reads sort in), apply SET, upsert each
   back, `UPDATE n` completes. `INSERT 0 n` keeps PG's tag shape.
+- **DELETE (2026-10-25, reshaped same day by the "respect the semantics,
+  minimal gateway processing" call)**: both frontends lower their native
+  filter into the shared Expr dialect and hand it to `Executor.Delete` —
+  Milvus resolves the matching primary keys and writes tombstones
+  server-side; `DeleteCount` is the count. The gateway streams no rows and
+  judges nothing: **the pre-delete refusal gates (no-WHERE, over-10000)
+  were removed** — real PostgreSQL deletes without a WHERE clause and real
+  Elasticsearch deletes with match_all, and the gateway honors both (a nil
+  filter renders as `pk is not null`, the type-agnostic match-all form,
+  because Milvus's delete does not read an empty expression as match-all
+  the way its query does). ES `DELETE /_doc/{id}` likewise lost its
+  existence pre-check: one delete call, and the server's count decides the
+  envelope — nothing removed is the 404 not_found answer, which is also
+  the honest one under concurrency. ES `total` and `deleted` carry the
+  same server count twice (one evaluation; they only diverge in real ES
+  when version conflicts skip documents). PG: `DELETE FROM t WHERE …`,
+  `DELETE n` completes, aliases/USING/RETURNING refuse by name (unimplemented
+  syntax, not policy); NoMatch plans short-circuit to `DELETE 0`. ES
+  `_delete_by_query` refuses only `max_docs` (capping the deletion and
+  staying silent would report deleted:N for fewer removed); timing knobs
+  (refresh/conflicts/wait_for_completion/slices/requests_per_second) are
+  accepted and ignored — they shape delivery, not results. knn as the
+  delete query refuses (the delete expression is scalar). The 10000 window
+  is now UPDATE's alone: UPDATE streams whole rows through the gateway
+  (read-modify-write), so the window is a resource bound there, not a
+  policy gate — and beyond-window UPDATEs refuse rather than silently
+  rewriting a prefix (that fix stays).
+- **Delete counts are Milvus's own DeleteCount** (probed directly with the
+  raw SDK, `TestMilvusDeleteCountProbe`, kept as the pin — the probe grew
+  across three CI runs as the picture sharpened): exact for real matches in
+  every state (1 for an existing key, N for an N-row filter, flushed or
+  growing, in-list and equality forms); exact 0 for an absent key after a
+  flush; but **one observed instability for an absent key in the growing state** — a
+  matrix run reported deleted=1 for a never-existing key where the probe
+  reports 0; a dedicated repro under the exact matrix conditions (freshly
+  recreated collection, unflushed insert, equality form, three tries)
+  failed to reproduce it, so it is archived as a one-off observation while
+  nothing depends on the count for absent keys. Consequences, in order of hardness:
+  (1) behavior contracts decided on the count (ES not_found) must run on a
+  Strong snapshot instead — DELETE /_doc/{id} pre-checks existence with the
+  point search and skips Delete entirely when invisible, because the
+  delete's own resolution runs on a bounded snapshot that lags Strong reads
+  (measured: a re-delete reported 1 even after a Strong query had stopped
+  returning the id; the probe stays green only because it flushes first);
+  (2) reported figures (DELETE n / deleted:N) ride DeleteCount — an earlier
+  count(*) pre-query was removed as a second filter evaluation that bought
+  no correctness (it reads the same snapshots); (3) cross-entry judging
+  (the write parity matrix) compares the two entries' counts against each
+  other, never against an absolute zero, with the state comparison as the
+  strong check. The bounded-snapshot window itself is a platform fact
+  clients must respect: a delete issued milliseconds after the write it
+  targets can miss it — the same read-your-writes window every read here
+  polls; real Elasticsearch's `_delete_by_query` without `refresh` has the
+  same default shape, and on the PG side it is the standing
+  no-transactions limitation. The e2e suites therefore settle writes
+  (waitVisible / waitGone) before asserting delete counts.
 - **pk/autoID policy**: this settles the 2026-09-18 proposal's key
   question for the current surface — pk is client-owned unless the
   schema says AutoID (then it is store-owned, always); ES _id and the
@@ -462,7 +518,7 @@ DDL remains a separate later slice).
   back **empty** rather than erroring — the read path's "server rejects a
   disagreeing metric" assumption no longer holds on this server; a local
   metric-vs-index check is a candidate follow-up.
-- **Not done here**: DELETE (doc or by_query), _bulk, _update_by_query,
+- **Not done here**: _bulk, _update_by_query,
   scripts, DDL (create index/mapping), array/sparse write encodings,
   upsert-by-ES-of-partial-doc (the ES index API stays whole-row put, as
   ES defines it).
