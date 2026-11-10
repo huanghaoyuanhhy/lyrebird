@@ -16,10 +16,11 @@ import (
 	"github.com/huanghaoyuanhhy/lyrebird/internal/translate/pg"
 )
 
-// updateScanLimit caps how many rows one UPDATE may rewrite. The
-// read-modify-write streams every match through the same window the read
-// path sorts in, so a write cannot exceed what a SELECT could fetch.
-const updateScanLimit = 10000
+// The write statements bound their scan with store.WriteScanLimit: the
+// read-modify-write (UPDATE) and the delete lane stream every match through
+// the same window the read path sorts in, so a write cannot exceed what a
+// SELECT could fetch — a statement matching more refuses instead of
+// silently touching a prefix.
 
 // writeWireError renders a write-path failure as a PG wire error: a strict
 // schema rejection carries its SQLSTATE (the class → code table below) so
@@ -122,12 +123,16 @@ func (s *Server) writeUpdateStatement(exec store.Executor, upd *pg.Update) wire.
 		if err != nil {
 			return wireError(err)
 		}
-		plan.Limit = updateScanLimit
+		plan.Limit = store.WriteScanLimit
 
 		result, err := exec.Search(ctx, upd.Table, plan)
 		if err != nil {
 			s.zapLogger().Error("update scan failed", zap.String("table", upd.Table), zap.Error(err))
 			return wireError(err)
+		}
+		if result.Total > store.WriteScanLimit {
+			return psqlerr.WithCode(fmt.Errorf("UPDATE matched %d rows, beyond the %d-row write window: narrow the WHERE clause",
+				result.Total, store.WriteScanLimit), codes.FeatureNotSupported)
 		}
 
 		rows := make([]translate.WriteRow, 0, len(result.Hits))
@@ -153,5 +158,50 @@ func (s *Server) writeUpdateStatement(exec store.Executor, upd *pg.Update) wire.
 			zap.Int64("updated", writeResult.Count),
 			zap.Duration("took", time.Since(start)))
 		return writer.Complete(fmt.Sprintf("UPDATE %d", writeResult.Count))
+	}
+}
+
+// writeDeleteStatement is the DELETE statement body: lower the WHERE into
+// the shared filter dialect and hand it to the store — Milvus resolves the
+// matching primary keys server-side. No WHERE clause deletes everything,
+// exactly what the statement means in PostgreSQL; a constant-false WHERE
+// completes as DELETE 0 without a round trip.
+func (s *Server) writeDeleteStatement(exec store.Executor, del *pg.Delete) wire.PreparedStatementFn {
+	return func(ctx context.Context, writer wire.DataWriter, parameters []wire.Parameter) (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = psqlerr.WithCode(fmt.Errorf("internal error while executing the statement: %v", p), codes.Internal)
+			}
+		}()
+		if len(parameters) > 0 {
+			return psqlerr.WithCode(errors.New("bind parameters are beyond the lyrebird write path: inline the literals"), codes.FeatureNotSupported)
+		}
+
+		start := time.Now()
+		schema, err := exec.Schema(ctx, del.Table)
+		if err != nil {
+			if errors.Is(err, store.ErrCollectionNotFound) {
+				return psqlerr.WithCode(fmt.Errorf("relation %q does not exist", del.Table), codes.UndefinedTable)
+			}
+			return wireError(err)
+		}
+		plan, err := del.Lower(schema)
+		if err != nil {
+			return wireError(err)
+		}
+		if plan.NoMatch {
+			return writer.Complete("DELETE 0")
+		}
+		writeResult, err := exec.Delete(ctx, del.Table, plan.Expr)
+		if err != nil {
+			s.zapLogger().Error("delete execution failed", zap.String("table", del.Table), zap.Error(err))
+			return writeWireError(err)
+		}
+
+		s.zapLogger().Info("pg delete",
+			zap.String("table", del.Table),
+			zap.Int64("deleted", writeResult.Count),
+			zap.Duration("took", time.Since(start)))
+		return writer.Complete(fmt.Sprintf("DELETE %d", writeResult.Count))
 	}
 }

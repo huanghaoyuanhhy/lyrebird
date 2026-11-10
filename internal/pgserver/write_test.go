@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/huanghaoyuanhhy/lyrebird/internal/store"
+	"github.com/huanghaoyuanhhy/lyrebird/internal/translate"
 )
 
 // writeExec runs one write statement and returns the command tag; INSERT and
@@ -104,6 +105,113 @@ func TestUpdateReadModifyWrite(t *testing.T) {
 				t.Fatalf("second row = %#v", rows[1])
 			}
 		})
+	}
+}
+
+func TestDeleteFiltersAndCounts(t *testing.T) {
+	for _, mode := range []string{"cache_statement", "simple_protocol"} {
+		t.Run(mode, func(t *testing.T) {
+			exec := testExecutor()
+			exec.deleteCount = 2
+			addr := startWireServer(t, exec)
+
+			tag := writeExec(t, addr, mode, "DELETE FROM items WHERE name <> 'none'")
+			if tag.String() != "DELETE 2" {
+				t.Fatalf("tag = %q, want the server's DeleteCount", tag.String())
+			}
+			if len(exec.deleteCalls) != 1 || exec.deleteCalls[0].Collection != "items" {
+				t.Fatalf("delete calls = %#v", exec.deleteCalls)
+			}
+			if exec.deleteCalls[0].Expr == nil {
+				t.Fatal("filtered delete sent a nil expr")
+			}
+			rendered, err := translate.Render(exec.deleteCalls[0].Expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rendered == "" {
+				t.Fatalf("filtered delete rendered match-everything: %q", rendered)
+			}
+
+			// a constant-false WHERE never reaches the store
+			tag = writeExec(t, addr, mode, "DELETE FROM items WHERE id = 1 AND FALSE")
+			if tag.String() != "DELETE 0" {
+				t.Fatalf("no-match tag = %q", tag.String())
+			}
+			if len(exec.deleteCalls) != 1 {
+				t.Fatalf("no-match ran a delete: %#v", exec.deleteCalls)
+			}
+
+			// a missing table answers like any other relation miss
+			pgErr := writeExpectError(t, addr, mode, "DELETE FROM ghost WHERE id = 1")
+			if pgErr.Code != "42P01" {
+				t.Fatalf("code = %s, want 42P01", pgErr.Code)
+			}
+		})
+	}
+}
+
+func TestDeleteWithoutWhereDeletesEverything(t *testing.T) {
+	for _, mode := range []string{"cache_statement", "simple_protocol"} {
+		t.Run(mode, func(t *testing.T) {
+			exec := testExecutor()
+			exec.deleteCount = 2
+			addr := startWireServer(t, exec)
+
+			tag := writeExec(t, addr, mode, "DELETE FROM items")
+			if tag.String() != "DELETE 2" {
+				t.Fatalf("tag = %q", tag.String())
+			}
+			if len(exec.deleteCalls) != 1 {
+				t.Fatalf("delete calls = %d", len(exec.deleteCalls))
+			}
+			// no WHERE means match everything: the filter rides to the store
+			// as nil (the store renders the match-all form)
+			if exec.deleteCalls[0].Expr != nil {
+				t.Fatalf("expr = %v, want nil (match everything)", exec.deleteCalls[0].Expr)
+			}
+		})
+	}
+}
+
+func TestDeleteNamedRejections(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		code string
+	}{
+		{"alias", "DELETE FROM items AS a WHERE a.id = 1", "0A000"},
+		{"using", "DELETE FROM items USING other WHERE items.id = 1", "0A000"},
+		{"schema-qualified", "DELETE FROM public.items WHERE id = 1", "0A000"},
+		{"bind parameter", "DELETE FROM items WHERE id = $1", "0A000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := startWireServer(t, testExecutor())
+			pgErr := writeExpectError(t, addr, "simple_protocol", tc.sql)
+			if pgErr.Code != tc.code {
+				t.Fatalf("code = %s, want %s (message: %s)", pgErr.Code, tc.code, pgErr.Message)
+			}
+		})
+	}
+}
+
+func TestUpdateBeyondScanWindowRefuses(t *testing.T) {
+	exec := testExecutor()
+	exec.result = &store.SearchResult{
+		Total: store.WriteScanLimit + 1,
+		Hits:  exec.result.Hits,
+	}
+	addr := startWireServer(t, exec)
+
+	// UPDATE streams rows through the gateway (read-modify-write), so its
+	// window is a resource bound; DELETE deletes server-side and has none.
+	pgErr := writeExpectError(t, addr, "simple_protocol", "UPDATE items SET price = 1 WHERE name <> 'none'")
+	if pgErr.Code != "0A000" {
+		t.Fatalf("update code = %s, want 0A000", pgErr.Code)
+	}
+	if len(exec.writeCalls) != 0 {
+		t.Fatal("update ran despite the over-window match count")
 	}
 }
 

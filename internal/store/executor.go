@@ -36,6 +36,12 @@ type Executor interface {
 
 	// Upsert writes rows by primary key, replacing each stored row whole.
 	Upsert(ctx context.Context, collection string, rows []translate.WriteRow) (WriteResult, error)
+
+	// Delete removes every row the filter matches, server-side: the caller
+	// lowers its native filter into the shared Expr dialect and Milvus
+	// resolves the matching primary keys and writes tombstones; the count
+	// is the server's answer. A nil expr matches everything.
+	Delete(ctx context.Context, collection string, expr translate.Expr) (WriteResult, error)
 }
 
 // Hit is one matched entity: its primary key and the fields fetched for it.
@@ -120,6 +126,25 @@ func (e *LogExecutor) Upsert(ctx context.Context, collection string, rows []tran
 	logger.Info("store: upsert (log executor)",
 		zap.String("collection", collection), zap.Int("rows", len(rows)))
 	return WriteResult{Count: int64(len(rows))}, nil
+}
+
+// Delete implements Executor: the stand-in removes nothing, logging the filter.
+func (e *LogExecutor) Delete(ctx context.Context, collection string, expr translate.Expr) (WriteResult, error) {
+	logger := e.Logger
+	if logger == nil {
+		logger = zap.L()
+	}
+	rendered := "(match everything)"
+	if expr != nil {
+		r, err := translate.Render(expr)
+		if err != nil {
+			return WriteResult{}, err
+		}
+		rendered = r
+	}
+	logger.Info("store: delete (log executor)",
+		zap.String("collection", collection), zap.String("filter", rendered))
+	return WriteResult{Count: 0}, nil
 }
 
 // Search implements Executor. Render errors are returned, not swallowed:

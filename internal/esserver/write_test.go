@@ -301,3 +301,100 @@ func TestBulkRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteDocumentById(t *testing.T) {
+	exec := &fakeExecutor{
+		metas:  []catalog.CollectionMeta{writeMeta},
+		result: &store.SearchResult{Total: 1, Hits: []store.Hit{{ID: "7", Source: map[string]any{"id": int64(7)}}}},
+	}
+	srv := writeServer(t, exec)
+
+	status, body := doJSON(t, srv, "DELETE", "/items/_doc/7", "")
+	if status != http.StatusOK || body["result"] != "deleted" || body["_id"] != "7" {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 || exec.deleteCalls[0].Collection != "items" {
+		t.Fatalf("delete calls = %#v", exec.deleteCalls)
+	}
+	rendered, err := translate.Render(exec.deleteCalls[0].Expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered != `id in [7]` {
+		t.Fatalf("filter = %q, want the pk-membership form", rendered)
+	}
+
+	// the not_found decision runs on the existence pre-check: nothing
+	// visible means 404, and no delete call at all
+	exec.result = &store.SearchResult{}
+	status, body = doJSON(t, srv, "DELETE", "/items/_doc/999", "")
+	if status != http.StatusNotFound || body["result"] != "not_found" {
+		t.Fatalf("missing status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatalf("missing doc ran a delete: %#v", exec.deleteCalls)
+	}
+
+	// a non-numeric id for a numeric key is a 400
+	status, body = doJSON(t, srv, "DELETE", "/items/_doc/notanumber", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("bad id status=%d body=%v", status, body)
+	}
+
+	// a missing index is a native 404
+	status, _ = doJSON(t, srv, "DELETE", "/ghost/_doc/1", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("ghost index status=%d", status)
+	}
+}
+
+func TestDeleteByQueryDeletesMatchedKeys(t *testing.T) {
+	exec := &fakeExecutor{
+		metas:       []catalog.CollectionMeta{writeMeta},
+		schema:      translate.MapSchema{"id": translate.TypeNumber, "name": translate.TypeKeyword, "price": translate.TypeNumber},
+		deleteCount: 2,
+	}
+	srv := writeServer(t, exec)
+
+	status, body := doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"range":{"price":{"lt":3}}}}`)
+	if status != http.StatusOK || body["total"] != float64(2) || body["deleted"] != float64(2) {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 1 {
+		t.Fatalf("delete calls = %d", len(exec.deleteCalls))
+	}
+	if exec.deleteCalls[0].Expr == nil {
+		t.Fatal("filtered delete sent a nil expr")
+	}
+	// one server-side evaluation: total and deleted carry the same count
+	if body["total"] != body["deleted"] {
+		t.Fatalf("total=%v deleted=%v, want equal", body["total"], body["deleted"])
+	}
+
+	// match_all deletes everything, as it does in Elasticsearch
+	exec.deleteCount = 5
+	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query", `{"query":{"match_all":{}}}`)
+	if status != http.StatusOK || body["deleted"] != float64(5) {
+		t.Fatalf("match_all status=%d body=%v", status, body)
+	}
+	if len(exec.deleteCalls) != 2 || exec.deleteCalls[1].Expr != nil {
+		t.Fatalf("match_all calls = %#v, want a nil (match-everything) expr", exec.deleteCalls)
+	}
+
+	// a body without a query member is a parse error
+	status, _ = doJSON(t, srv, "POST", "/items/_delete_by_query", `{}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("no query status=%d", status)
+	}
+
+	// max_docs would cap the deletion: refusing beats silently deleting fewer
+	status, body = doJSON(t, srv, "POST", "/items/_delete_by_query?max_docs=5", `{"query":{"match_all":{}}}`)
+	if status != http.StatusBadRequest || body["error"].(map[string]any)["type"] != "unsupported_exception" {
+		t.Fatalf("max_docs status=%d body=%v", status, body)
+	}
+	// timing knobs are accepted and ignored
+	status, _ = doJSON(t, srv, "POST", "/items/_delete_by_query?slices=auto&requests_per_second=100", `{"query":{"match_all":{}}}`)
+	if status != http.StatusOK {
+		t.Fatalf("timing knobs status=%d", status)
+	}
+}
