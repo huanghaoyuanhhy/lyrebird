@@ -85,6 +85,21 @@ func TestPgserverParity(t *testing.T) {
 			fmt.Sprintf("SELECT id FROM %s WHERE name IN ('bravo', 'echo') AND price BETWEEN 15 AND 25 ORDER BY id LIMIT 10", milvustest.Collection)},
 		{"equals null matches nothing",
 			fmt.Sprintf("SELECT id FROM %s WHERE price = NULL LIMIT 10", milvustest.Collection)},
+		// Three-valued NULL cases: reference Postgres is the judge. The
+		// negated shapes were silent wrong answers before the wUnknown fix
+		// (NOT (price = NULL) matched everything; the truth is zero rows).
+		{"not equals null matches nothing",
+			fmt.Sprintf("SELECT id FROM %s WHERE NOT (price = NULL) LIMIT 10", milvustest.Collection)},
+		{"not in with a null member matches nothing",
+			fmt.Sprintf("SELECT id FROM %s WHERE price NOT IN (10, NULL) LIMIT 10", milvustest.Collection)},
+		{"not (not in with a null member) is the positive in",
+			fmt.Sprintf("SELECT id FROM %s WHERE NOT (price NOT IN (10, NULL)) ORDER BY id LIMIT 10", milvustest.Collection)},
+		{"not (in with a null member) matches nothing",
+			fmt.Sprintf("SELECT id FROM %s WHERE NOT (price IN (10, NULL)) LIMIT 10", milvustest.Collection)},
+		{"not (between with a null bound) keeps the lower rejects",
+			fmt.Sprintf("SELECT id FROM %s WHERE NOT (price BETWEEN 10 AND NULL) ORDER BY id LIMIT 10", milvustest.Collection)},
+		{"bare null matches nothing",
+			fmt.Sprintf("SELECT id FROM %s WHERE NULL LIMIT 10", milvustest.Collection)},
 		{"is null reads the null rows",
 			fmt.Sprintf("SELECT id FROM %s WHERE note IS NULL ORDER BY id LIMIT 10", milvustest.Collection)},
 		{"l2 distance order",

@@ -553,9 +553,10 @@ func (p *parser) parseNegatedTail(left valueNode) (whereExpr, error) {
 	}
 }
 
-// parseInTail reads the parenthesized literal list of IN, resolving the
-// three-valued edge cases: a NULL member adds nothing to a positive IN
-// (UNKNOWN rows never pass) and kills a negated one outright.
+// parseInTail reads the parenthesized literal list of IN. NULL members are
+// dropped from the value list (a positive IN never passes an unknown row
+// either way) and recorded on the node: they make the negated form
+// never-true, and its negation lowers back to the positive IN.
 func (p *parser) parseInTail(left valueNode, negated bool) (whereExpr, error) {
 	col, err := columnOf(left, "IN")
 	if err != nil {
@@ -590,10 +591,7 @@ func (p *parser) parseInTail(left valueNode, negated bool) (whereExpr, error) {
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
 	}
-	if negated && hadNull {
-		return wFalse{}, nil
-	}
-	return wIn{col: col, vals: vals, negated: negated}, nil
+	return wIn{col: col, vals: vals, negated: negated, hadNull: hadNull}, nil
 }
 
 // parseBetweenTail reads "BETWEEN lo AND hi"; the AND belongs to the
@@ -617,20 +615,19 @@ func (p *parser) parseBetweenTail(left valueNode, negated bool) (whereExpr, erro
 	if lo.col != "" || hi.col != "" {
 		return nil, unsupportedErrf("BETWEEN bounds must be literals")
 	}
-	if lo.lit.kind == litNull || hi.lit.kind == litNull {
-		// x BETWEEN lo AND NULL is UNKNOWN whenever lo fails to hold it —
-		// no row passes; the exact translation is the empty filter.
-		return wFalse{}, nil
-	}
-	return wBetw{col: col, lo: lo.lit, hi: hi.lit, negated: negated}, nil
+	return wBetw{
+		col: col, lo: lo.lit, hi: hi.lit, negated: negated,
+		nullLo: lo.lit.kind == litNull, nullHi: hi.lit.kind == litNull,
+	}, nil
 }
 
 // combineComparison pairs one column with one literal, flipping a
-// literal-first comparison. A NULL side never passes a row (three-valued
-// logic), which folds to the constant false.
+// literal-first comparison. A NULL side is unknown on every row
+// (three-valued logic): no row passes, and a NOT must not resurrect it, so
+// it folds to wUnknown rather than the plain false.
 func combineComparison(left valueNode, op string, right valueNode) (whereExpr, error) {
 	if left.lit.kind == litNull || right.lit.kind == litNull {
-		return wFalse{}, nil
+		return wUnknown{}, nil
 	}
 	switch {
 	case left.col == "" && right.col == "":
@@ -646,8 +643,8 @@ func combineComparison(left valueNode, op string, right valueNode) (whereExpr, e
 }
 
 // barePredicate handles a value with no comparison after it: TRUE/FALSE
-// constants (nil = matches everything), a NULL (never passes), or a bare
-// column — PG requires that to be boolean, so it lowers to col == true.
+// constants (nil = matches everything), a NULL (unknown on every row), or a
+// bare column — PG requires that to be boolean, so it lowers to col == true.
 func barePredicate(v valueNode) (whereExpr, error) {
 	switch {
 	case v.col != "":
@@ -658,7 +655,7 @@ func barePredicate(v valueNode) (whereExpr, error) {
 		}
 		return wFalse{}, nil
 	case v.lit.kind == litNull:
-		return wFalse{}, nil
+		return wUnknown{}, nil
 	default:
 		return nil, parseErrf("expected a comparison after [%s]: a bare literal is not a predicate", v.lit.text)
 	}
